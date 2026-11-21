@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -80,6 +80,10 @@ class PatchSubmission(BaseModel):
     pr_title: Optional[str] = Field(default=None, max_length=256, description="Optional PR title override")
     pr_body: Optional[str] = Field(default=None, max_length=16000, description="Optional PR description")
     create_pr: bool = Field(default=True, description="Automatically create or reuse an open CI/CD PR")
+    patch_mode: Literal["auto", "incremental", "cumulative"] = Field(
+        default="auto",
+        description="auto: try incremental (incl. 3-way) then cumulative; incremental: never reset to base_branch; cumulative: always apply on base_branch",
+    )
 
     @field_validator("nickname")
     @classmethod

@@ -72,15 +72,30 @@ Hana-ame/private-demo
 
 ---
 
-## 四、部署前准备
+## 四、部署前准备（默认使用 `gh` 指令管理）
 
-1. **GitHub Token（`GITHUB_TOKEN`）**
-   - Classic PAT：勾选 `repo`。
-   - Fine-grained PAT：授予目标仓库 `Contents (R/W)`、`Pull requests (R/W)`、`Actions (Read-only)`。
+1. **使用 GitHub CLI (`gh`) 登录认证（默认推荐）**
+   网关默认通过 `gh auth token` 自动获取并缓存凭据（不再强制手填 `GITHUB_TOKEN`，且传递给 `git` 时使用 `GIT_CONFIG_*` 环境变量，不暴露在 `/proc/<pid>/cmdline`）：
+   ```bash
+   # 登录 GitHub（选择 HTTPS，勾选 repo 权限）
+   gh auth login
+   # 确认登录状态
+   gh auth status
+   ```
+   - **Docker 部署**：`docker-compose.yml` 默认将宿主机 `~/.config/gh` 只读挂载进容器，容器内内置 `gh` 直接读取。
+   - **systemd 部署**：执行 `sudo GH_CONFIG_DIR=/etc/git-gateway/gh gh auth login` 即可。
+   - **备选覆盖**：若无 `gh` 环境，也可在 `.env` 中显式设置 `GITHUB_TOKEN=ghp_...` 覆盖。
+
 2. **生成管理员密钥（`ADMIN_TOKEN`）**
    ```bash
    openssl rand -hex 32
    ```
+
+3. **本次安全与鲁棒性加固一览（v2.1.0）**
+   - **防 CI 投毒双重校验**：在 `git apply` + `git add -A` 后通过 `git diff-tree -r --raw -z` 校验 Git 实际解析出的最终路径，彻底封堵 C-style 引号路径、八进制转义（`\147`）、`./` 路径段、`rename to` 及 `mode 120000` 符号链接绕过。
+   - **Token 零命令行泄露**：改用 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` 环境变量传递鉴权头。
+   - **Git Smart-HTTP 代理加固**：严格限制 `GET info/refs` + 白名单 `service=git-upload-pack`（防 HPP 参数污染），`POST git-upload-pack` 限制请求体上限（默认 2 MiB，防 OOM DoS），保持 `Content-Encoding` 与 `aiter_raw()` 一致。
+   - **并发与边界修复**：增量提交优先 `--3way` 避免静默丢弃前序改动（支持 `patch_mode=auto|incremental|cumulative`）；`ensure_pr` 捕获 422 并发竞态自动复用 PR；CI 状态按每个 workflow 仅取最新 run/attempt；`limit`/`tail` 非法参数返回 400；`get_job_logs` 限制最大 5 MiB 流式读取；`list_prs` 分页过滤 `nickname`；默认不盲信 `X-Forwarded-*`（需显式 `TRUST_PROXY_HEADERS=true`）。
 
 ---
 

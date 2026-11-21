@@ -40,7 +40,7 @@ def tail_lines(text: str, max_lines: int) -> str:
 
 
 class GitHubClient:
-    """Thin async GitHub REST API v3 client using server-side token authentication."""
+    """Thin async GitHub REST API v3 client using gh CLI / server-side token authentication."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -65,7 +65,7 @@ class GitHubClient:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "git-gateway/2.0",
+            "User-Agent": "git-gateway/2.1",
         }
         tok = self.settings.resolve_github_token()
         if tok:
@@ -107,20 +107,9 @@ class GitHubClient:
             raise GitHubAPIError(resp.status_code, detail)
         return resp
 
-    async def ensure_pr(
-        self,
-        owner: str,
-        repo: str,
-        *,
-        head_branch: str,
-        base_branch: str,
-        title: str,
-        body: str,
-    ) -> Tuple[int, str, bool]:
-        """Find an existing open PR for head->base, or create a new one.
-
-        Returns: (pr_number, pr_html_url, reused_existing)
-        """
+    async def _find_open_pr(
+        self, owner: str, repo: str, head_branch: str, base_branch: str
+    ) -> Optional[Tuple[int, str]]:
         existing = await self._request(
             "GET",
             f"/repos/{owner}/{repo}/pulls",
@@ -134,20 +123,48 @@ class GitHubClient:
         prs = existing.json()
         if isinstance(prs, list) and prs:
             pr = prs[0]
-            return int(pr["number"]), str(pr.get("html_url", "")), True
+            return int(pr["number"]), str(pr.get("html_url", ""))
+        return None
 
-        created = await self._request(
-            "POST",
-            f"/repos/{owner}/{repo}/pulls",
-            json_body={
-                "title": title,
-                "head": head_branch,
-                "base": base_branch,
-                "body": body,
-            },
-        )
-        pr = created.json()
-        return int(pr["number"]), str(pr.get("html_url", "")), False
+    async def ensure_pr(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+    ) -> Tuple[int, str, bool]:
+        """Find an existing open PR for head->base, or create a new one.
+
+        Handles concurrent 422 race conditions by re-querying open PRs.
+        Returns: (pr_number, pr_html_url, reused_existing)
+        """
+        found = await self._find_open_pr(owner, repo, head_branch, base_branch)
+        if found:
+            return found[0], found[1], True
+
+        try:
+            created = await self._request(
+                "POST",
+                f"/repos/{owner}/{repo}/pulls",
+                json_body={
+                    "title": title,
+                    "head": head_branch,
+                    "base": base_branch,
+                    "body": body,
+                },
+            )
+            pr = created.json()
+            return int(pr["number"]), str(pr.get("html_url", "")), False
+        except GitHubAPIError as exc:
+            if exc.status_code == 422:
+                # Another concurrent request may have just created the PR
+                found_retry = await self._find_open_pr(owner, repo, head_branch, base_branch)
+                if found_retry:
+                    return found_retry[0], found_retry[1], True
+            raise
 
     async def list_prs(
         self,
@@ -159,35 +176,49 @@ class GitHubClient:
         base_branch: Optional[str] = None,
         limit: int = 30,
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {
-            "state": state,
-            "per_page": max(1, min(limit, 100)),
-        }
-        if base_branch:
-            params["base"] = base_branch
-        resp = await self._request("GET", f"/repos/{owner}/{repo}/pulls", params=params)
-        items = resp.json()
-        if not isinstance(items, list):
-            return []
-
-        results: List[Dict[str, Any]] = []
+        limit = max(1, min(limit, 100))
         nick_prefix = f"{nickname}/" if nickname else None
-        for pr in items:
-            head_ref = str((pr.get("head") or {}).get("ref", ""))
-            if nick_prefix and not head_ref.startswith(nick_prefix):
-                continue
-            results.append(
-                {
-                    "number": pr.get("number"),
-                    "title": pr.get("title"),
-                    "state": pr.get("state"),
-                    "head_branch": head_ref,
-                    "base_branch": (pr.get("base") or {}).get("ref"),
-                    "head_sha": (pr.get("head") or {}).get("sha"),
-                    "url": pr.get("html_url"),
-                    "updated_at": pr.get("updated_at"),
-                }
-            )
+        results: List[Dict[str, Any]] = []
+
+        # When filtering by nickname on an active repo, paginate up to 5 pages of 100
+        max_pages = 5 if nick_prefix else 1
+        per_page = 100 if nick_prefix else limit
+
+        for page in range(1, max_pages + 1):
+            params: Dict[str, Any] = {
+                "state": state,
+                "per_page": per_page,
+                "page": page,
+            }
+            if base_branch:
+                params["base"] = base_branch
+            resp = await self._request("GET", f"/repos/{owner}/{repo}/pulls", params=params)
+            items = resp.json()
+            if not isinstance(items, list) or not items:
+                break
+
+            for pr in items:
+                head_ref = str((pr.get("head") or {}).get("ref", ""))
+                if nick_prefix and not head_ref.startswith(nick_prefix):
+                    continue
+                results.append(
+                    {
+                        "number": pr.get("number"),
+                        "title": pr.get("title"),
+                        "state": pr.get("state"),
+                        "head_branch": head_ref,
+                        "base_branch": (pr.get("base") or {}).get("ref"),
+                        "head_sha": (pr.get("head") or {}).get("sha"),
+                        "url": pr.get("html_url"),
+                        "updated_at": pr.get("updated_at"),
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+
+            if len(items) < per_page:
+                break
+
         return results
 
     async def get_pr(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
@@ -204,16 +235,42 @@ class GitHubClient:
         runs = data.get("check_runs", []) if isinstance(data, dict) else []
         return runs if isinstance(runs, list) else []
 
+    @staticmethod
+    def _select_latest_workflow_runs(workflow_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only the latest run/attempt per workflow so passing re-runs clear stale failures."""
+        latest_by_wf: Dict[Any, Dict[str, Any]] = {}
+        for run in workflow_runs:
+            wf_key = run.get("workflow_id") or run.get("name") or run.get("id")
+            rank = (
+                int(run.get("run_number") or 0),
+                int(run.get("run_attempt") or 0),
+                int(run.get("id") or 0),
+            )
+            prev = latest_by_wf.get(wf_key)
+            if prev is None:
+                latest_by_wf[wf_key] = run
+            else:
+                prev_rank = (
+                    int(prev.get("run_number") or 0),
+                    int(prev.get("run_attempt") or 0),
+                    int(prev.get("id") or 0),
+                )
+                if rank >= prev_rank:
+                    latest_by_wf[wf_key] = run
+        return list(latest_by_wf.values())
+
     async def get_workflow_jobs_for_sha(self, owner: str, repo: str, sha: str) -> List[Dict[str, Any]]:
         runs_resp = await self._request(
             "GET",
             f"/repos/{owner}/{repo}/actions/runs",
-            params={"head_sha": sha, "per_page": 20},
+            params={"head_sha": sha, "per_page": 30},
         )
         runs_data = runs_resp.json()
         workflow_runs = runs_data.get("workflow_runs", []) if isinstance(runs_data, dict) else []
+        latest_runs = self._select_latest_workflow_runs(workflow_runs)
+
         all_jobs: List[Dict[str, Any]] = []
-        for run in workflow_runs:
+        for run in latest_runs:
             run_id = run.get("id")
             if not run_id:
                 continue
@@ -229,6 +286,37 @@ class GitHubClient:
                 all_jobs.append(job)
         return all_jobs
 
+    async def _download_bounded_text(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: Dict[str, str],
+        max_bytes: int,
+    ) -> Tuple[int, str, Optional[str]]:
+        """Stream-download up to max_bytes to prevent OOM on huge CI logs."""
+        try:
+            async with client.stream("GET", url, headers=headers, timeout=45.0) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    return resp.status_code, "", resp.headers.get("location")
+                buf = bytearray()
+                truncated = False
+                async for chunk in resp.aiter_bytes():
+                    remaining = max_bytes - len(buf)
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(chunk) > remaining:
+                        buf.extend(chunk[:remaining])
+                        truncated = True
+                        break
+                    buf.extend(chunk)
+                text = buf.decode("utf-8", errors="replace")
+                if truncated:
+                    text += f"\n... (log truncated at {max_bytes} bytes limit) ...\n"
+                return resp.status_code, text, None
+        except httpx.HTTPError as exc:
+            raise GitHubAPIError(502, f"GitHub log fetch network error: {exc}") from exc
+
     async def get_job_logs(
         self,
         owner: str,
@@ -240,19 +328,19 @@ class GitHubClient:
         """Fetch raw Actions job logs, following redirect without leaking auth token."""
         url = f"{self.settings.github_api_base}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
         client = self._get_client()
-        try:
-            resp = await client.get(url, headers=self._headers(), timeout=45.0)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                loc = resp.headers.get("location")
-                if not loc:
-                    raise GitHubAPIError(502, "missing redirect location for job logs")
-                # Do NOT forward GitHub Bearer token to external pre-signed blob URL
-                resp = await client.get(loc, headers={"User-Agent": "git-gateway/2.0"}, timeout=45.0)
-        except httpx.HTTPError as exc:
-            raise GitHubAPIError(502, f"GitHub log fetch network error: {exc}") from exc
-        if resp.status_code >= 400:
-            raise GitHubAPIError(resp.status_code, resp.text[:400])
-        clean = strip_ansi(resp.text)
+        max_bytes = self.settings.max_log_bytes
+
+        status, text, loc = await self._download_bounded_text(client, url, self._headers(), max_bytes)
+        if status in (301, 302, 303, 307, 308):
+            if not loc:
+                raise GitHubAPIError(502, "missing redirect location for job logs")
+            # Do NOT forward GitHub Bearer token to external pre-signed blob URL
+            status, text, _ = await self._download_bounded_text(
+                client, loc, {"User-Agent": "git-gateway/2.1"}, max_bytes
+            )
+        if status >= 400:
+            raise GitHubAPIError(status, text[:400])
+        clean = strip_ansi(text)
         return tail_lines(clean, tail)
 
     async def get_pr_ci_status(

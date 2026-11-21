@@ -50,7 +50,8 @@ def _print_startup_diagnostics(settings) -> None:
     print(f"  TEMP_DIR        : {settings.temp_dir} (zero persistent local storage)", flush=True)
     print(f"  REPO_RULES_FILE : {settings.repo_rules_file or '(inline rules)'} ({len(settings.active_rules())} rules)", flush=True)
     print(f"  REPO_ALIASES    : {settings.repo_aliases or '(none - using /<owner>/<repo>)'}", flush=True)
-    print(f"  GITHUB_TOKEN    : {'configured' if settings.resolve_github_token() else 'NOT SET'}", flush=True)
+    tok = settings.resolve_github_token()
+    print(f"  GITHUB_AUTH     : {'configured (' + settings.token_source() + ')' if tok else 'NOT SET (run `gh auth login` or set GITHUB_TOKEN)'}", flush=True)
     print(f"  ADMIN_TOKEN     : {'configured' if settings.admin_token else 'NOT SET (admin disabled)'}", flush=True)
     if proxy_vars:
         print(f"  PROXY ENV       : {proxy_vars}", flush=True)
@@ -90,8 +91,8 @@ def main() -> None:
         app,
         host=settings.host,
         port=settings.port,
-        proxy_headers=True,
-        forwarded_allow_ips="*",
+        proxy_headers=settings.trust_proxy_headers,
+        forwarded_allow_ips="*" if settings.trust_proxy_headers else "127.0.0.1",
         timeout_keep_alive=30,
         backlog=2048,
     )

@@ -18,7 +18,7 @@ from .config import Settings
 from .git_ops import GitPatchEngine, PatchValidationError
 from .git_proxy import handle_git_smart_http
 from .github_client import GitHubAPIError, GitHubClient
-from .models import PatchResponse, PatchSubmission
+from .models import AdminContentUpdate, PatchResponse, PatchSubmission
 from .prompt_renderer import render_agent_landing, render_todo_page
 from .store import ContentStore
 
@@ -41,9 +41,36 @@ def _wants_json(request: Request) -> bool:
 def _infer_base_url(request: Request, settings: Settings) -> str:
     if settings.public_base_url:
         return settings.public_base_url
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    if settings.trust_proxy_headers:
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    else:
+        proto = request.url.scheme
+        host = request.headers.get("host") or request.url.netloc
     return f"{proto}://{host}".rstrip("/")
+
+
+def _parse_int_param(
+    request: Request,
+    name: str,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+) -> int:
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"query parameter '{name}' must be an integer")
+    if val < min_value or val > max_value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"query parameter '{name}' must be between {min_value} and {max_value}",
+        )
+    return val
 
 
 def _verify_admin(request: Request, settings: Settings) -> None:
@@ -66,11 +93,10 @@ async def _read_content_body(request: Request) -> str:
     if "application/json" in ctype:
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except Exception as exc:
+            parsed = AdminContentUpdate.model_validate(payload)
+        except (json.JSONDecodeError, ValidationError) as exc:
             raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}")
-        if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
-            raise HTTPException(status_code=400, detail="JSON body must contain string field 'content'")
-        return payload["content"]
+        return parsed.content
     return raw.decode("utf-8", errors="replace")
 
 
@@ -159,6 +185,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "ok": True,
                 "version": __version__,
                 "github_token_configured": bool(settings.resolve_github_token()),
+                "github_token_source": settings.token_source(),
                 "admin_token_configured": bool(settings.admin_token),
                 "repo_rules_file": str(settings.repo_rules_file) if settings.repo_rules_file else None,
                 "repo_rules_count": len(settings.active_rules()),
@@ -285,7 +312,7 @@ def create_app(settings: Settings) -> FastAPI:
             state = request.query_params.get("state", "open")
             nickname = request.query_params.get("nickname") or None
             base_branch = request.query_params.get("base_branch") or None
-            limit = int(request.query_params.get("limit", "30") or "30")
+            limit = _parse_int_param(request, "limit", default=30, min_value=1, max_value=100)
             try:
                 prs = await gh.list_prs(
                     owner,
@@ -316,7 +343,7 @@ def create_app(settings: Settings) -> FastAPI:
         m = PR_LOGS_RE.match(suffix)
         if m and request.method == "GET":
             pr_number = int(m.group(1))
-            tail = int(request.query_params.get("tail", "200") or "200")
+            tail = _parse_int_param(request, "tail", default=200, min_value=0, max_value=10000)
             include_all = request.query_params.get("all", "").lower() in ("1", "true", "yes")
             try:
                 data = await gh.get_pr_logs(
@@ -333,7 +360,7 @@ def create_app(settings: Settings) -> FastAPI:
         m = JOB_LOGS_RE.match(suffix)
         if m and request.method == "GET":
             job_id = int(m.group(1))
-            tail = int(request.query_params.get("tail", "200") or "200")
+            tail = _parse_int_param(request, "tail", default=200, min_value=0, max_value=10000)
             try:
                 log_text = await gh.get_job_logs(owner, repo, job_id, tail=tail)
             except GitHubAPIError as exc:
@@ -381,6 +408,7 @@ async def _handle_patch_submission(
                 pr_title=q.get("pr_title") or None,
                 pr_body=q.get("pr_body") or None,
                 create_pr=create_pr_raw not in ("0", "false", "no"),
+                patch_mode=q.get("patch_mode", "auto"),
             )
     except (json.JSONDecodeError, ValidationError) as exc:
         return JSONResponse(
@@ -399,6 +427,7 @@ async def _handle_patch_submission(
             base_commit=sub.base_commit,
             message=sub.message,
             patch_text=sub.patch,
+            patch_mode=sub.patch_mode,
         )
     except PatchValidationError as exc:
         return JSONResponse(

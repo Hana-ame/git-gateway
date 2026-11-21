@@ -34,7 +34,19 @@
 2. **原生 Agent 引导页 + 独立 TODO 端点**：支持路径别名映射（如 `path/to/repo -> Hana-ame/repo`），Admin 可通过带 Token 的 API 随时热更新全局/单库通用说明与 TODO 列表；内容仅存于进程内存，**不落任何本地磁盘**（重启后回到默认模板，可用 Admin API 重新下发）。
 3. **内置 CI/CD 真实错误日志拉取**：不仅返回 `check_runs` 状态，还直接通过 GitHub REST API 拉取失败 Job 日志（安全处理 302 跳转，不向外部 Blob 泄露 Token），自动清除 ANSI 转义符并支持 `?tail=200`。
 4. **防 CI 投毒与隔离 Worktree**：默认拦截任何修改 `.github/workflows/*` 与 `.github/actions/*` 的 Patch；每次提交在临时 Worktree 中执行，失败不污染本地 Mirror。
-5. **零 `gh` CLI / SSH 依赖**：纯 `GITHUB_TOKEN` + HTTPS + GitHub REST API v3，支持 Docker / systemd 一键部署。
+5. **默认用 `gh` CLI 管理认证**：服务启动时调用一次 `gh auth token` 并缓存（不阻塞事件循环），`/health` 会返回 `github_token_source: "gh_cli"`；如需覆盖，显式设置 `GITHUB_TOKEN` 即可（优先级更高）。无需 SSH 密钥，纯 HTTPS + GitHub REST API v3。
+
+## 认证方式
+
+三种部署方式都默认复用**已登录的 `gh` CLI**，无需在配置里保存 Token：
+
+| 部署方式 | 认证做法 |
+|---------|---------|
+| **Docker Compose** | 宿主机先 `gh auth login`；`docker-compose.yml` 默认把 `~/.config/gh` 只读挂载到容器内 `/home/gateway/.config/gh` |
+| **Python 3 / systemd** | 安装脚本创建 `/etc/git-gateway/gh`（700）并写入 `GH_CONFIG_DIR`，执行 `sudo GH_CONFIG_DIR=/etc/git-gateway/gh gh auth login` |
+| **显式覆盖** | 在 `.env` 中设置 `GITHUB_TOKEN=ghp_...`，或关闭 `USE_GH_CLI=false` |
+
+`ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。
 
 ## 快速启动
 
@@ -43,10 +55,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-export GITHUB_TOKEN="ghp_your_token_with_repo_and_actions_read"
-export ADMIN_TOKEN="your_strong_admin_secret"
+# 认证：默认走已登录的 gh CLI（也可用 GITHUB_TOKEN 覆盖）
+gh auth login
+
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
 export PUBLIC_BASE_URL="https://proxy.com"
-# 白名单：gitignore 风格规则文件（支持热重载）；也可用旧写法 ALLOWED_REPOS="Hana-ame/repo"
+# 白名单：gitignore 风格规则文件（支持热重载）；旧写法 ALLOWED_REPOS="Hana-ame/repo" 仍兼容
 export REPO_RULES_FILE="./repos.txt"
 export REPO_ALIASES="path/to/repo=Hana-ame/repo"
 

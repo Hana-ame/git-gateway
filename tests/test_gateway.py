@@ -616,5 +616,69 @@ class GitGatewayTestSuite(unittest.TestCase):
         self.assertFalse(matcher.is_allowed("other-org", "repo"))  # default disallow
 
 
+    # 8. Regression tests for v2.1.0 security & protocol hardening
+    def test_08_security_bypass_hpp_and_param_validation(self) -> None:
+        # 8a. Quoted path & octal escape CI poisoning bypass MUST be blocked with 403
+        octal_evil = (
+            'diff --git "a/.\147ithub/workflows/pwn.yml" "b/.\147ithub/workflows/pwn.yml"\n'
+            'new file mode 100644\n'
+            '--- /dev/null\n'
+            '+++ "b/.\147ithub/workflows/pwn.yml"\n'
+            '@@ -0,0 +1 @@\n'
+            '+run: pwn\n'
+        )
+        r_oct = self.client.post(
+            "/path/to/repo/patches",
+            json={"nickname": "mallory", "base_branch": "main", "message": "x", "patch": octal_evil},
+        )
+        self.assertEqual(r_oct.status_code, 403)
+
+        quoted_evil = (
+            'diff --git "a/.github/workflows/pwn.yml" "b/.github/workflows/pwn.yml"\n'
+            'new file mode 100644\n'
+            '--- /dev/null\n'
+            '+++ "b/.github/workflows/pwn.yml"\n'
+            '@@ -0,0 +1 @@\n'
+            '+run: pwn\n'
+        )
+        r_q = self.client.post(
+            "/path/to/repo/patches",
+            json={"nickname": "mallory", "base_branch": "main", "message": "x", "patch": quoted_evil},
+        )
+        self.assertEqual(r_q.status_code, 403)
+
+        # 8b. Symlink (mode 120000) patch MUST be blocked with 403
+        symlink_patch = (
+            "diff --git a/evil_link b/evil_link\n"
+            "new file mode 120000\n"
+            "--- /dev/null\n"
+            "+++ b/evil_link\n"
+            "@@ -0,0 +1 @@\n"
+            "+.github/workflows\n"
+        )
+        r_sym = self.client.post(
+            "/path/to/repo/patches",
+            json={"nickname": "mallory", "base_branch": "main", "message": "x", "patch": symlink_patch},
+        )
+        self.assertEqual(r_sym.status_code, 403)
+
+        # 8c. HPP (?service=git-receive-pack&service=git-upload-pack) MUST be 403
+        self.assertEqual(
+            self.client.get(
+                "/path/to/repo.git/info/refs?service=git-receive-pack&service=git-upload-pack"
+            ).status_code,
+            403,
+        )
+        # Wrong method on info/refs -> 405
+        self.assertEqual(
+            self.client.post("/path/to/repo.git/info/refs?service=git-upload-pack").status_code,
+            405,
+        )
+
+        # 8d. Invalid integer query params -> 400 (never 500)
+        self.assertEqual(self.client.get("/path/to/repo/prs?limit=abc").status_code, 400)
+        self.assertEqual(self.client.get("/path/to/repo/prs/1/logs?tail=abc").status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

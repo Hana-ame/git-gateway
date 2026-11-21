@@ -12,13 +12,17 @@ services:
       GATEWAY_HOST: "0.0.0.0"
       GATEWAY_PORT: "8000"
       REPO_RULES_FILE: "/app/repos.txt"
+      GH_CONFIG_DIR: "/home/gateway/.config/gh"
     ports:
       - "${BIND_HOST:-0.0.0.0}:${GATEWAY_PORT:-8000}:8000"
     volumes:
-      # 仅只读挂载白名单/黑名单规则文件（支持热重载），不挂载任何本地数据持久化目录
+      # 1. 只读挂载 gitignore 风格白名单/黑名单规则文件（支持热重载）
       - ./repos.txt:/app/repos.txt:ro
+      # 2. 默认使用宿主机已登录的 gh CLI 凭据（先在宿主机执行 `gh auth login`）
+      #    如改为在 .env 中传 GITHUB_TOKEN，可注释掉下面这行
+      - ${GH_HOST_CONFIG_DIR:-~/.config/gh}:/home/gateway/.config/gh:ro
     tmpfs:
-      # 临时文件全部落在内存 tmpfs (/tmp)，容器重启自动清空，零磁盘残留
+      # 所有临时 Git 克隆与 Worktree 全部落在内存 tmpfs (/tmp)，零本地持久化存储
       - /tmp:rw,noexec,nosuid,size=512m
     read_only: true
     security_opt:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import posixpath
 import subprocess
 import tempfile
 import threading
@@ -23,6 +24,13 @@ DEFAULT_BLOCKED_PATHS = [
 def default_temp_dir() -> Path:
     r"""Return OS temp directory (/tmp/git-gateway on POSIX, %TEMP%\git-gateway on Windows)."""
     return Path(tempfile.gettempdir()) / "git-gateway"
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -59,7 +67,6 @@ class RepoRuleMatcher:
     def parse_lines(lines: List[str]) -> List[RepoRule]:
         rules: List[RepoRule] = []
         for raw_line in lines:
-            # Strip CR/LF and trailing unescaped spaces (gitignore convention)
             line = raw_line.rstrip("\r\n")
             while line.endswith(" ") and not line.endswith("\\ "):
                 line = line[:-1]
@@ -79,10 +86,8 @@ class RepoRuleMatcher:
 
             if not pattern:
                 continue
-            # Support trailing slash shorthand like "Hana-ame/" -> "Hana-ame/*"
             if pattern.endswith("/"):
                 pattern = pattern + "*"
-            # Strip leading slash if user wrote "/Hana-ame/repo"
             pattern = pattern.lstrip("/")
             rules.append(RepoRule(pattern=pattern, negated=negated, raw=raw_line.strip()))
         return rules
@@ -118,7 +123,7 @@ class RepoRuleMatcher:
 
     def is_allowed(self, owner: str, repo: str) -> bool:
         full = f"{owner}/{repo}"
-        allowed = False  # Default: no match => disallow
+        allowed = False  # Default fail-closed: no match => disallow
         for rule in self._load_rules():
             if self._match_pattern(full, rule.pattern):
                 allowed = not rule.negated
@@ -129,26 +134,32 @@ class RepoRuleMatcher:
 class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
-    public_base_url: str = ""  # e.g. https://proxy.com (auto-inferred from request if empty)
+    public_base_url: str = ""  # e.g. https://proxy.com (recommended in production)
+    trust_proxy_headers: bool = False  # Only trust X-Forwarded-* when behind a trusted reverse proxy
     temp_dir: Path = field(default_factory=default_temp_dir)
-    github_token: str = ""  # PAT with repo/actions:read; optional one-time fallback to `gh auth token`
+    # Default auth uses `gh auth token` (GitHub CLI). Explicit GITHUB_TOKEN env overrides if needed.
+    github_token: str = ""
+    use_gh_cli: bool = True
     admin_token: str = ""  # Required for PUT/DELETE /admin/* endpoints
     github_web_base: str = "https://github.com"
     github_api_base: str = "https://api.github.com"
     repo_rules_file: Optional[Path] = None
-    # Inline rules (used by tests or fallback when repo_rules_file is not set)
     repo_rules: Optional[List[str]] = None
-    # Optional path aliases: {"path/to/repo": "Hana-ame/repo"}
     repo_aliases: Dict[str, str] = field(default_factory=dict)
     default_base_branch: str = "main"
     blocked_patch_paths: List[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATHS))
+    allow_symlink_patches: bool = False  # Block mode 120000 symlinks by default to prevent path escapes
     max_patch_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    max_git_proxy_body_bytes: int = 2 * 1024 * 1024  # 2 MiB cap for git-upload-pack negotiation POST
+    max_log_bytes: int = 5 * 1024 * 1024  # 5 MiB cap for downloaded Actions job logs
     git_timeout_seconds: int = 120
+    # Backward-compatible alias for tests
     allow_gh_cli_fallback: bool = True
 
     _matcher: Optional[RepoRuleMatcher] = field(default=None, init=False, repr=False)
     _token_resolved: bool = field(default=False, init=False, repr=False)
     _cached_token: str = field(default="", init=False, repr=False)
+    _token_source: str = field(default="none", init=False, repr=False)
     _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -177,12 +188,19 @@ class Settings:
             self._rebuild_matcher()
         return self._matcher.get_rules() if self._matcher else []
 
-    def resolve_github_token(self) -> str:
-        """Return configured GITHUB_TOKEN or one-time cached `gh auth token` fallback.
+    def token_source(self) -> str:
+        self.resolve_github_token()
+        return self._token_source
 
-        Cached so request handlers never block the asyncio event loop on subprocess calls.
+    def resolve_github_token(self) -> str:
+        """Resolve GitHub token (cached so async handlers never block on subprocess).
+
+        Priority:
+          1. Explicit `github_token` (if provided via CLI/env)
+          2. Default `gh auth token` via GitHub CLI (`use_gh_cli` and `allow_gh_cli_fallback`)
         """
         if self.github_token:
+            self._token_source = "env/arg"
             return self.github_token
         if self._token_resolved:
             return self._cached_token
@@ -190,7 +208,8 @@ class Settings:
             if self._token_resolved:
                 return self._cached_token
             tok = ""
-            if self.allow_gh_cli_fallback:
+            src = "none"
+            if self.use_gh_cli and self.allow_gh_cli_fallback:
                 try:
                     proc = subprocess.run(
                         ["gh", "auth", "token"],
@@ -201,9 +220,11 @@ class Settings:
                     )
                     if proc.returncode == 0 and proc.stdout.strip():
                         tok = proc.stdout.strip()
+                        src = "gh_cli"
                 except (FileNotFoundError, subprocess.SubprocessError):
                     pass
             self._cached_token = tok
+            self._token_source = src
             self._token_resolved = True
             return tok
 
@@ -213,24 +234,24 @@ class Settings:
         return self._matcher.is_allowed(owner, repo) if self._matcher else False
 
     def is_patch_path_blocked(self, rel_path: str) -> bool:
-        normalized = rel_path.replace("\\", "/")
-        while normalized.startswith("./"):
-            normalized = normalized[2:]
-        normalized = normalized.lstrip("/")
+        normalized = rel_path.replace("\\", "/").strip()
+        if not normalized:
+            return False
+        # Collapse intermediate ./ and ../ segments deterministically
+        normalized = posixpath.normpath(normalized).lstrip("/")
+        if normalized == "." or normalized.startswith("../") or normalized == "..":
+            return True
         for pat in self.blocked_patch_paths:
-            if fnmatch.fnmatchcase(normalized, pat):
+            pat_norm = pat.strip().lstrip("/")
+            if fnmatch.fnmatchcase(normalized, pat_norm):
                 return True
-            if pat.endswith("/**") and normalized.startswith(pat[:-3] + "/"):
-                return True
+            if pat_norm.endswith("/**"):
+                prefix = pat_norm[:-3]
+                if normalized == prefix or normalized.startswith(prefix + "/"):
+                    return True
         return False
 
     def resolve_repo_path(self, raw_path: str) -> Optional[Tuple[str, str, str]]:
-        """Resolve a URL prefix (alias or owner/repo) to (public_prefix, owner, repo).
-
-        Supports both:
-          - Aliases like `path/to/repo` -> `Hana-ame/repo`
-          - Standard `<owner>/<repo>` (with optional `.git` suffix stripped)
-        """
         cleaned = raw_path.strip("/")
         if not cleaned:
             return None
@@ -252,11 +273,6 @@ class Settings:
         return None
 
     def split_repo_and_suffix(self, full_path: str) -> Optional[Tuple[str, str, str, str]]:
-        """Split a request path into (public_prefix, owner, repo, suffix).
-
-        Matches longest configured alias first; otherwise treats the first two
-        segments as `<owner>/<repo>`.
-        """
         cleaned = full_path.strip("/")
         if not cleaned:
             return None
@@ -284,7 +300,6 @@ class Settings:
 
 
 def parse_aliases(raw: str) -> Dict[str, str]:
-    """Parse comma-separated `alias=owner/repo` entries."""
     result: Dict[str, str] = {}
     if not raw:
         return result
@@ -301,7 +316,7 @@ def parse_aliases(raw: str) -> Dict[str, str]:
 
 
 def load_settings_from_env() -> Settings:
-    """Load Settings from environment variables."""
+    """Load Settings from environment variables (fail-closed if no rules exist)."""
     rules_file_raw = os.getenv("REPO_RULES_FILE", "").strip()
     rules_file: Optional[Path] = None
     inline_rules: Optional[List[str]] = None
@@ -311,11 +326,11 @@ def load_settings_from_env() -> Settings:
     elif Path("repos.txt").exists():
         rules_file = Path("repos.txt")
     else:
-        # Backward-compatible fallback if REPO_RULES_FILE is not provided
         allow_raw = os.getenv("ALLOWED_REPOS", "").strip()
         if allow_raw:
             inline_rules = [x.strip() for x in allow_raw.split(",") if x.strip()]
         else:
+            # Fail-closed: points to repos.txt (if missing -> 0 rules -> deny all)
             rules_file = Path("repos.txt")
 
     blocked_raw = os.getenv("BLOCKED_PATCH_PATHS", "")
@@ -334,8 +349,10 @@ def load_settings_from_env() -> Settings:
         host=os.getenv("GATEWAY_HOST", "0.0.0.0"),
         port=int(os.getenv("GATEWAY_PORT", "8000")),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").rstrip("/"),
+        trust_proxy_headers=_parse_bool_env("TRUST_PROXY_HEADERS", False),
         temp_dir=temp_dir,
         github_token=os.getenv("GITHUB_TOKEN", "").strip(),
+        use_gh_cli=_parse_bool_env("USE_GH_CLI", True),
         admin_token=os.getenv("ADMIN_TOKEN", "").strip(),
         github_web_base=os.getenv("GITHUB_WEB_BASE", "https://github.com").rstrip("/"),
         github_api_base=os.getenv("GITHUB_API_BASE", "https://api.github.com").rstrip("/"),
@@ -344,6 +361,9 @@ def load_settings_from_env() -> Settings:
         repo_aliases=parse_aliases(os.getenv("REPO_ALIASES", "")),
         default_base_branch=os.getenv("DEFAULT_BASE_BRANCH", "main"),
         blocked_patch_paths=blocked,
+        allow_symlink_patches=_parse_bool_env("ALLOW_SYMLINK_PATCHES", False),
         max_patch_bytes=int(os.getenv("MAX_PATCH_BYTES", str(10 * 1024 * 1024))),
+        max_git_proxy_body_bytes=int(os.getenv("MAX_GIT_PROXY_BODY_BYTES", str(2 * 1024 * 1024))),
+        max_log_bytes=int(os.getenv("MAX_LOG_BYTES", str(5 * 1024 * 1024))),
         git_timeout_seconds=int(os.getenv("GIT_TIMEOUT_SECONDS", "120")),
     )
