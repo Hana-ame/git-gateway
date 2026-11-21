@@ -250,10 +250,10 @@ class GitHubClient:
                 resp = await client.get(loc, headers={"User-Agent": "git-gateway/2.0"}, timeout=45.0)
         except httpx.HTTPError as exc:
             raise GitHubAPIError(502, f"GitHub log fetch network error: {exc}") from exc
-            if resp.status_code >= 400:
-                raise GitHubAPIError(resp.status_code, resp.text[:400])
-            clean = strip_ansi(resp.text)
-            return tail_lines(clean, tail)
+        if resp.status_code >= 400:
+            raise GitHubAPIError(resp.status_code, resp.text[:400])
+        clean = strip_ansi(resp.text)
+        return tail_lines(clean, tail)
 
     async def get_pr_ci_status(
         self,
