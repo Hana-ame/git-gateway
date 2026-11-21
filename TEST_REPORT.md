@@ -1,9 +1,9 @@
 # git-gateway 测试报告
 
-- **测试来源**：GitHub Actions CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)），commit `2cd2d58`（v2.1.0）
+- **测试来源**：GitHub Actions CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)），commit `a1af31d`
 - **运行环境**：`Ubuntu 26.04 (ubuntu-26.04)` / Python `3.11` 与 `3.12` 双版本矩阵 / `git 2.56.1`
-- **测试结果**：**8 / 8 通过**（两个 Python 版本均通过）
-- **语句覆盖率**：`75%`（`gateway/` 共 1346 条语句，未覆盖 336 条）
+- **测试结果**：**10 / 10 通过**（两个 Python 版本均通过）
+- **语句覆盖率**：`78%`（`gateway/` 共 1499 条语句，未覆盖 333 条）
 - **依赖**：无网络依赖——所有用例在本地真实裸 Git 仓库 + 本地 Mock GitHub HTTP 服务上端到端执行
 
 ## 测试用例明细
@@ -18,6 +18,8 @@
 | `test_06_multithreaded_concurrency_stress` | 12 线程池 14 项并发压测（8 个不同 Agent 同时提交 + 3 个相同昵称并发提交 + 3 个 Admin TODO 并发写入）：验证 100% 成功、同分支 3 次提交无丢写、零残留临时 Worktree |
 | `test_07_gitignore_style_repo_rules_and_hot_reload` | gitignore 风格规则匹配（`!` 取反、通配符、尾斜杠简写、最后匹配生效、默认拒绝）与规则文件热重载 |
 | `test_08_security_bypass_hpp_and_param_validation` | **v2.1.0 新增**：C-style 引号路径与八进制转义（`\147`）绕过必须 403、`mode 120000` 符号链接必须 403、HPP 参数污染（`?service=git-receive-pack&service=git-upload-pack`）必须 403、`info/refs` 错误方法必须 405、`limit`/`tail` 非法整数必须 400（不得 500） |
+| `test_09_admin_content_persists_across_restart` | **持久化新增**：Admin 写入 TODO + 全局 prompt 后，用同一 `CONTENT_DIR` 重建 app 实例（等价进程重启），内容仍在；`/health` 报告 `content_store.mode == "file"` 且计数正确 |
+| `test_10_content_store_degrades_and_quarantines` | **持久化新增**：① `CONTENT_DIR` 指向普通文件 → 降级 memory 且仍可读写 ② `content.json` 损坏 → 保留为 `content.corrupt-*.json`、服务以空态启动、后续写入可被新实例读到 |
 
 ## 并发与安全机制验证结论
 
@@ -32,5 +34,5 @@
 |-----|------|
 | `Syntax`（3.11 / 3.12） | `compileall -W error::SyntaxWarning`、全模块导入检查、AST 扫描 `raise` 之后的不可达语句 |
 | `Test`（3.11 / 3.12） | pytest 全量用例 + 覆盖率报告、`repos.txt` 规则解析与 allow/deny 语义断言 |
-| `Docker build + smoke test` | `docker compose config` 校验；**断言 gh 挂载源已展开为绝对路径且只读**（实测 `~` → `/home/runner/.config/gh`）；镜像构建；以 `--read-only --tmpfs /tmp --security-opt no-new-privileges` 启动并探测 `/health`；确认以 `uid=1000(gateway)` 非 root 运行；**无凭据启动冒烟**——未登录 gh 且未设 Token 时仍可服务并如实报告 `github_token_source=none`，同时校验镜像内 `gh 2.105.0` 可用 |
+| `Docker build + smoke test` | `docker compose config` 校验；**断言 gh 挂载源已展开为绝对路径且只读**（实测 `~` → `/home/runner/.config/gh`）；镜像构建；以 `--read-only --tmpfs /tmp --security-opt no-new-privileges` 启动并探测 `/health`；确认以 `uid=1000(gateway)` 非 root 运行；**无凭据启动冒烟**——未登录 gh 且未设 Token 时仍可服务并如实报告 `github_token_source=none`，同时校验镜像内 `gh 2.105.0` 可用；**Admin 内容跨容器重建验证**——命名卷 + canary 探针，`docker rm -f` 后重建容器仍能读到，`content_store.mode=file`；**降级验证**——`CONTENT_DIR` 指向只读路径时降级为 `mode=memory`、给出 `degraded_reason` 且日志告警 |
 | `Deploy assets sanity` | 部署文件完整性、`.env.example` 覆盖全部环境变量（含 `_parse_bool_env` 包装项）、systemd unit 语法校验、shell 脚本可执行位与语法 |
