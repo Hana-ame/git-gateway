@@ -121,7 +121,7 @@ def _format_logs_as_text(data: dict[str, Any]) -> str:
 
 
 def create_app(settings: Settings) -> FastAPI:
-    store = ContentStore()
+    store = ContentStore(settings.content_dir)
     gh = GitHubClient(settings)
     git_engine = GitPatchEngine(settings)
 
@@ -191,7 +191,8 @@ def create_app(settings: Settings) -> FastAPI:
                 "repo_rules_count": len(settings.active_rules()),
                 "repo_aliases": settings.repo_aliases,
                 "temp_dir": str(settings.temp_dir),
-                "local_storage": "none (in-memory + OS temp dir only)",
+                "local_storage": "git worktrees in OS temp dir (deleted per request)",
+                "content_store": store.info(),
             }
         )
 

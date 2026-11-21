@@ -137,6 +137,8 @@ class Settings:
     public_base_url: str = ""  # e.g. https://proxy.com (recommended in production)
     trust_proxy_headers: bool = False  # Only trust X-Forwarded-* when behind a trusted reverse proxy
     temp_dir: Path = field(default_factory=default_temp_dir)
+    # Admin prompt/TODO persistence. None => memory-only (lost on restart).
+    content_dir: Optional[Path] = None
     # Default auth uses `gh auth token` (GitHub CLI). Explicit GITHUB_TOKEN env overrides if needed.
     github_token: str = ""
     use_gh_cli: bool = True
@@ -345,12 +347,16 @@ def load_settings_from_env() -> Settings:
     temp_dir_raw = os.getenv("TEMP_DIR", "").strip()
     temp_dir = Path(temp_dir_raw) if temp_dir_raw else default_temp_dir()
 
+    content_dir_raw = os.getenv("CONTENT_DIR", "").strip()
+    content_dir = Path(content_dir_raw).expanduser() if content_dir_raw else None
+
     return Settings(
         host=os.getenv("GATEWAY_HOST", "0.0.0.0"),
         port=int(os.getenv("GATEWAY_PORT", "8000")),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "").rstrip("/"),
         trust_proxy_headers=_parse_bool_env("TRUST_PROXY_HEADERS", False),
         temp_dir=temp_dir,
+        content_dir=content_dir,
         github_token=os.getenv("GITHUB_TOKEN", "").strip(),
         use_gh_cli=_parse_bool_env("USE_GH_CLI", True),
         admin_token=os.getenv("ADMIN_TOKEN", "").strip(),

@@ -238,6 +238,93 @@ jobs:
           PY
           docker logs gw | tail -20
 
+      - name: Admin content survives container recreation (named volume)
+        run: |
+          set -euo pipefail
+          docker volume create gwdata >/dev/null
+          start_gw() {
+            docker rm -f gw >/dev/null 2>&1 || true
+            docker run -d --name gw \
+              -p 127.0.0.1:8000:8000 \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+              -v gwdata:/var/lib/git-gateway \
+              -e GITHUB_TOKEN=dummy-token-for-smoke-test \
+              -e ADMIN_TOKEN=dummy-admin-token \
+              git-gateway:ci >/dev/null
+            for i in $(seq 1 30); do
+              curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && return 0
+              sleep 1
+            done
+            echo "::error::container did not become healthy"
+            docker logs gw
+            return 1
+          }
+
+          start_gw
+          curl -fsS -X PUT http://127.0.0.1:8000/admin/prompt \
+            -H "Authorization: Bearer dummy-admin-token" \
+            --data-binary "PERSISTENCE-CANARY-must-survive-restart"
+          curl -fsS http://127.0.0.1:8000/Hana-ame/repo | grep -q "PERSISTENCE-CANARY" \
+            || { echo "::error::canary not served before restart"; exit 1; }
+
+          # Recreate the container from scratch: in-memory state would be gone here
+          start_gw
+          curl -fsS http://127.0.0.1:8000/Hana-ame/repo | grep -q "PERSISTENCE-CANARY-must-survive-restart" \
+            || { echo "::error::Admin prompt did NOT survive container recreation"; docker logs gw; exit 1; }
+          echo "✓ Admin prompt survived container recreation"
+
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          health = json.load(urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5))
+          store = health["content_store"]
+          assert store["mode"] == "file", store
+          assert store["path"].startswith("/var/lib/git-gateway/"), store
+          assert store["global_prompt_customized"] is True, store
+          print(f"✓ content_store after restart: {store}")
+          PY
+          docker rm -f gw >/dev/null 2>&1 || true
+          docker volume rm -f gwdata >/dev/null 2>&1 || true
+
+      - name: Unwritable CONTENT_DIR degrades to memory and says so
+        run: |
+          set -euo pipefail
+          docker rm -f gw >/dev/null 2>&1 || true
+          # /app sits on the read-only rootfs and is not a volume -> mkdir must fail
+          docker run -d --name gw \
+            -p 127.0.0.1:8000:8000 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            -e CONTENT_DIR=/app/ro-content \
+            -e GITHUB_TOKEN=dummy-token-for-smoke-test \
+            -e ADMIN_TOKEN=dummy-admin-token \
+            git-gateway:ci >/dev/null
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && break
+            if [ "$i" -eq 30 ]; then
+              echo "::error::gateway did not start with an unwritable CONTENT_DIR"
+              docker logs gw
+              exit 1
+            fi
+            sleep 1
+          done
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          health = json.load(urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5))
+          assert health["ok"] is True, health
+          store = health["content_store"]
+          assert store["mode"] == "memory", store
+          assert store["degraded_reason"], "degraded mode must explain why"
+          print(f"✓ degraded to memory mode without crashing: {store['degraded_reason'][:90]}")
+          PY
+          docker logs gw | grep -qE "content persistence DISABLED|MEMORY ONLY" \
+            || { echo "::error::missing loud warning about disabled persistence"; docker logs gw; exit 1; }
+          echo "✓ startup log warns that Admin content will be lost"
+
       - name: Container cleanup
         if: always()
         run: docker rm -f gw || true

@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _print_startup_diagnostics(settings) -> None:
+def _print_startup_diagnostics(settings, app=None) -> None:
     proxy_vars = {
         k: os.environ[k]
         for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY")
@@ -47,7 +47,20 @@ def _print_startup_diagnostics(settings) -> None:
     print("=" * 64, flush=True)
     print(f"git-gateway starting on http://{settings.host}:{settings.port}", flush=True)
     print(f"  PUBLIC_BASE_URL : {settings.public_base_url or '(auto from request headers)'}", flush=True)
-    print(f"  TEMP_DIR        : {settings.temp_dir} (zero persistent local storage)", flush=True)
+    print(f"  TEMP_DIR        : {settings.temp_dir} (git worktrees only; deleted per request)", flush=True)
+    store_info = (
+        app.state.store.info()
+        if app is not None and hasattr(app.state, "store")
+        else {"mode": "unknown", "path": None}
+    )
+    if store_info["mode"] == "file":
+        print(f"  CONTENT_DIR     : {store_info['path']} (Admin prompts/TODOs persisted)", flush=True)
+    else:
+        print(
+            "  CONTENT_DIR     : MEMORY ONLY - Admin prompts/TODOs will be LOST on restart"
+            + (f" ({store_info['degraded_reason']})" if store_info.get("degraded_reason") else ""),
+            flush=True,
+        )
     print(f"  REPO_RULES_FILE : {settings.repo_rules_file or '(inline rules)'} ({len(settings.active_rules())} rules)", flush=True)
     print(f"  REPO_ALIASES    : {settings.repo_aliases or '(none - using /<owner>/<repo>)'}", flush=True)
     tok = settings.resolve_github_token()
@@ -85,7 +98,7 @@ def main() -> None:
         settings.github_token = args.github_token
 
     app = create_app(settings)
-    _print_startup_diagnostics(settings)
+    _print_startup_diagnostics(settings, app)
 
     uvicorn.run(
         app,

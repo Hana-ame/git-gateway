@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from gateway.app import create_app
 from gateway.config import RepoRuleMatcher, Settings
+from gateway.store import ContentStore
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -240,6 +241,7 @@ class GitGatewayTestSuite(unittest.TestCase):
         self.settings = Settings(
             public_base_url="https://proxy.example.com",
             temp_dir=self.tmp / "gateway_tmp",
+            content_dir=self.tmp / "content",
             github_token="test-gh-token",
             admin_token="secret-admin-token",
             github_web_base=f"file://{self.upstream_root}",
@@ -303,7 +305,7 @@ class GitGatewayTestSuite(unittest.TestCase):
         )
         self.assertEqual(r_prompt.status_code, 200)
 
-        # Verify in-memory prompt & TODO update on same app instance (zero local disk storage)
+        # Verify prompt & TODO update is visible on the same instance
         r_landing2 = self.client.get("/path/to/repo")
         self.assertIn("Custom guide for Hana-ame/repo", r_landing2.text)
         self.assertIn("Fix calculator bug", r_landing2.text)
@@ -678,6 +680,76 @@ class GitGatewayTestSuite(unittest.TestCase):
         # 8d. Invalid integer query params -> 400 (never 500)
         self.assertEqual(self.client.get("/path/to/repo/prs?limit=abc").status_code, 400)
         self.assertEqual(self.client.get("/path/to/repo/prs/1/logs?tail=abc").status_code, 400)
+
+    # 9. Admin prompt/TODO is configuration: it must survive a restart
+    def test_09_admin_content_persists_across_restart(self) -> None:
+        headers = {"Authorization": "Bearer secret-admin-token"}
+        self.assertEqual(
+            self.client.put(
+                "/admin/path/to/repo/todo",
+                headers=headers,
+                content="# TODO\n- [ ] persisted task\n",
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.put(
+                "/admin/prompt",
+                headers=headers,
+                content="Global guide that must survive restart",
+            ).status_code,
+            200,
+        )
+
+        # Simulate a process restart: build a brand-new app from the same CONTENT_DIR
+        client2 = TestClient(create_app(self.settings))
+
+        landing = client2.get("/path/to/repo")
+        self.assertEqual(landing.status_code, 200)
+        self.assertIn("persisted task", landing.text)
+        self.assertIn("persisted task", client2.get("/path/to/repo/todo").text)
+
+        # The global prompt written before the restart still backs other repos
+        self.assertIn(
+            "Global guide that must survive restart",
+            client2.get("/Hana-ame/repo").text,
+        )
+
+        health = client2.get("/health").json()
+        self.assertEqual(health["content_store"]["mode"], "file")
+        self.assertTrue(health["content_store"]["global_prompt_customized"])
+        self.assertEqual(health["content_store"]["repo_todo_count"], 1)
+
+    # 10. Persistence degrades safely instead of crashing the gateway
+    def test_10_content_store_degrades_and_quarantines(self) -> None:
+        # (a) CONTENT_DIR points at a regular file -> not a directory -> memory mode
+        blocked = self.tmp / "not-a-dir"
+        blocked.write_text("x", encoding="utf-8")
+        degraded = ContentStore(blocked)
+        self.assertFalse(degraded.is_persistent)
+        info = degraded.info()
+        self.assertEqual(info["mode"], "memory")
+        self.assertTrue(info["degraded_reason"])
+        # memory mode still serves and mutates in-process
+        degraded.set_todo("Hana-ame", "repo", "# mem\n- [ ] x\n")
+        self.assertIn("# mem", degraded.get_todo("Hana-ame", "repo")["content"])
+
+        # (b) Corrupt content.json is preserved aside; the gateway keeps working
+        corrupt_dir = self.tmp / "corrupt"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "content.json").write_text("{not json", encoding="utf-8")
+        store = ContentStore(corrupt_dir)
+        self.assertTrue(store.is_persistent)
+        self.assertIsNotNone(store.info()["degraded_reason"])
+        self.assertTrue(store.get_global_prompt()["is_default"])
+        self.assertEqual(len(list(corrupt_dir.glob("content.corrupt-*.json"))), 1)
+
+        # Writes recover after quarantine and are readable by a fresh instance
+        store.set_todo("Hana-ame", "repo", "# recovered\n")
+        self.assertIn(
+            "# recovered",
+            ContentStore(corrupt_dir).get_todo("Hana-ame", "repo")["content"],
+        )
 
 
 if __name__ == "__main__":

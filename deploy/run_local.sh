@@ -41,5 +41,5 @@ echo "[INFO] 安装/校验依赖 ..."
 .venv/bin/pip install --upgrade pip >/dev/null
 .venv/bin/pip install -r requirements.txt >/dev/null
 
-echo "[INFO] 启动 git-gateway (临时文件使用系统 /tmp，零本地持久化存储) ..."
+echo "[INFO] 启动 git-gateway (Git 临时文件走系统 /tmp 并即时清理；Admin 内容持久化到 ${CONTENT_DIR:-内存模式}) ..."
 exec .venv/bin/python main.py "$@"

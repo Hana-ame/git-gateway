@@ -1,7 +1,7 @@
 # git-gateway 部署与使用指南（Docker & Python 3 直接部署）
 
-本版本已针对**网络稳定性**、**零本地持久化存储**和**gitignore 风格白名单/黑名单**进行了专门重构：
-- **零本地存储**：不创建 `./data` 或 `/var/lib/git-gateway`，Prompt/TODO 驻留内存，所有临时 Git 克隆/Worktree/Patch 均自动写入系统临时目录（Linux/macOS 为 `/tmp/git-gateway`，Windows 为 `%TEMP%\git-gateway`），并在每次请求结束后立即清理。
+本版本已针对**网络稳定性**、**数据持久化边界**和**gitignore 风格白名单/黑名单**进行了专门重构：
+- **持久化边界清晰**：Git 临时数据（bare clone / Worktree / Patch）**不落盘**，全部写入系统临时目录（Linux/macOS 为 `/tmp/git-gateway`，Windows 为 `%TEMP%\git-gateway`）并在每次请求结束后立即清理；而 **Admin 下发的 Prompt/TODO 属于配置数据**，落盘到 `CONTENT_DIR`（原子写 + `flock` 跨进程锁），容器重建/服务重启后依然存在。目录不可写时自动降级为内存态，并在启动日志与 `/health` 的 `content_store.mode` 中显式告警。
 - **gitignore 风格黑白名单**：通过纯文本 `repos.txt` 管理，支持热重载（改完文件无需重启）。
 - **Python 网络加固**：消除事件循环阻塞、修复 Git Clone 代理压缩头问题、支持系统 SOCKS/HTTP 代理、显式配置 Uvicorn 反代头与监听诊断。
 
@@ -101,7 +101,7 @@ Hana-ame/private-demo
 
 ## 五、方案 A：Docker 部署（推荐）
 
-容器默认以 `read_only: true` + 内存 `tmpfs` 挂载 `/tmp` 运行，**零本地持久化目录**，仅只读挂载 `repos.txt`。
+容器默认以 `read_only: true` + 内存 `tmpfs` 挂载 `/tmp` 运行；除只读挂载 `repos.txt` 外，**唯一可写的数据目录是命名卷 `git-gateway-data`**（挂到 `/var/lib/git-gateway`），用于保存 Admin 下发的 Prompt/TODO。`docker compose down` 不会删除该卷，`docker compose down -v` 才会清空。
 
 ### 方式 A1：Docker Compose
 
@@ -140,10 +140,14 @@ docker run -d \
   -e GATEWAY_HOST=0.0.0.0 \
   -e GATEWAY_PORT=8000 \
   -e REPO_RULES_FILE=/app/repos.txt \
+  -e CONTENT_DIR=/var/lib/git-gateway/content \
   -p 0.0.0.0:8000:8000 \
   -v "$(pwd)/repos.txt:/app/repos.txt:ro" \
+  -v git-gateway-data:/var/lib/git-gateway \
   git-gateway:latest
 ```
+
+> **持久化提醒**：`-v git-gateway-data:/var/lib/git-gateway` 这一行决定 Admin 下发的 Prompt/TODO 能否跨容器重建保留。省略它时数据仍可存活于 `docker restart`，但 `docker rm` 后会丢失；可用 `curl -s http://127.0.0.1:8000/health | jq .content_store` 确认当前模式。
 
 ---
 

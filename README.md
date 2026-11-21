@@ -31,7 +31,7 @@
 ## 相比旧版 `gitproxy` 的架构改进
 
 1. **彻底关闭 `git-receive-pack`（只读克隆代理）**：杜绝匿名任意建分支、删分支、force-push 风险；所有写入必须经 `POST /patches` 并被服务端强制约束在 `<nickname>/<original_branch>` 命名空间下。
-2. **原生 Agent 引导页 + 独立 TODO 端点**：支持路径别名映射（如 `path/to/repo -> Hana-ame/repo`），Admin 可通过带 Token 的 API 随时热更新全局/单库通用说明与 TODO 列表；内容仅存于进程内存，**不落任何本地磁盘**（重启后回到默认模板，可用 Admin API 重新下发）。
+2. **原生 Agent 引导页 + 独立 TODO 端点**：支持路径别名映射（如 `path/to/repo -> Hana-ame/repo`），Admin 可通过带 Token 的 API 随时热更新全局/单库通用说明与 TODO 列表；内容作为**配置数据落盘**到 `CONTENT_DIR`（原子写 + `flock` 跨进程锁），容器重建/服务重启后依然存在。
 3. **内置 CI/CD 真实错误日志拉取**：不仅返回 `check_runs` 状态，还直接通过 GitHub REST API 拉取失败 Job 日志（安全处理 302 跳转，不向外部 Blob 泄露 Token），自动清除 ANSI 转义符并支持 `?tail=200`。
 4. **防 CI 投毒与隔离 Worktree**：默认拦截任何修改 `.github/workflows/*` 与 `.github/actions/*` 的 Patch；每次提交在临时 Worktree 中执行，失败不污染本地 Mirror。
 5. **默认用 `gh` CLI 管理认证**：服务启动时调用一次 `gh auth token` 并缓存（不阻塞事件循环），`/health` 会返回 `github_token_source: "gh_cli"`；如需覆盖，显式设置 `GITHUB_TOKEN` 即可（优先级更高）。无需 SSH 密钥，纯 HTTPS + GitHub REST API v3。
@@ -47,6 +47,26 @@
 | **显式覆盖** | 在 `.env` 中设置 `GITHUB_TOKEN=ghp_...`，或关闭 `USE_GH_CLI=false` |
 
 `ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。
+
+## 数据持久化边界
+
+两类数据的生命周期刻意分开：
+
+| 数据 | 存放位置 | 重启后 |
+|------|---------|--------|
+| Git bare clone / Worktree / Patch | 系统临时目录（`TEMP_DIR`），请求结束即删 | 不需要保留 |
+| **Admin 下发的 Prompt / TODO** | **`CONTENT_DIR`**，原子写 + `flock` 锁 | **保留** |
+
+`CONTENT_DIR` 在三种部署方式中都已配置好：Docker 用命名卷 `git-gateway-data`（挂到 `/var/lib/git-gateway`），systemd 用 `StateDirectory=git-gateway`，本地开发留空则退回内存态（重启即失，启动日志会告警）。
+
+随时可用 `/health` 确认当前模式：
+
+```bash
+curl -s http://127.0.0.1:8000/health | jq .content_store
+# {"mode":"file","path":"/var/lib/git-gateway/content/content.json","degraded_reason":null,...}
+```
+
+若 `mode` 为 `memory`，说明目录不可写（常见于 `read_only` 容器忘记挂卷），此时 Admin 内容会在重启后回到内置默认模板。
 
 ## 快速启动
 
