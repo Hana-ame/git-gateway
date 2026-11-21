@@ -97,18 +97,20 @@ jobs:
         run: |
           python -m pytest tests -v --cov=gateway --cov-report=term-missing
 
-      - name: Verify rules file parses
+      - name: Verify rules file parses and gates correctly
         run: |
           python - <<'PY'
           from pathlib import Path
           from gateway.config import RepoRuleMatcher
 
           m = RepoRuleMatcher(rules_file=Path("repos.txt"))
-          rules = m.active_rules()
+          rules = m.get_rules()
           assert rules, "repos.txt produced zero rules"
-          print(f"✓ repos.txt -> {len(rules)} rule(s)")
-          for r in rules:
-              print(f"   {'deny ' if r.negated else 'allow'} {r.pattern}")
+          print(f"✓ repos.txt -> {len(rules)} rule(s): {rules}")
+
+          assert m.is_allowed("Hana-ame", "repo"), "Hana-ame/repo should be allowed"
+          assert not m.is_allowed("someone-else", "repo"), "unlisted repo must be denied by default"
+          print("✓ allow/deny semantics OK (default = disallow)")
           PY
 
   # ---------------------------------------------------------------- 部署产物
