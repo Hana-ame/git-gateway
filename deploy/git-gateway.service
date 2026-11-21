@@ -1,0 +1,21 @@
+[Unit]
+Description=git-gateway (Zero-Permission Crowdsourcing Patch Proxy)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/git-gateway
+Environment=GATEWAY_HOST=0.0.0.0
+Environment=GATEWAY_PORT=8000
+Environment=PUBLIC_BASE_URL=https://proxy.com
+Environment=DATA_DIR=/var/lib/git-gateway
+Environment=ALLOWED_REPOS=Hana-ame/repo
+Environment=REPO_ALIASES=path/to/repo=Hana-ame/repo
+Environment=GITHUB_TOKEN=ghp_replace_with_your_token
+Environment=ADMIN_TOKEN=replace_with_strong_random_secret
+ExecStart=/opt/git-gateway/.venv/bin/python /opt/git-gateway/main.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+# 运行时数据（SQLite / 缓存 / worktree）
+data/
+
+# 环境变量与密钥
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
