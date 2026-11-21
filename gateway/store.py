@@ -1,20 +1,10 @@
-"""File-backed atomic persistence with thread + cross-process (flock) locking."""
+"""Pure in-memory thread-safe content store (zero local disk storage)."""
 
 from __future__ import annotations
 
-import contextlib
-import json
-import os
-import tempfile
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterator, Optional
-
-try:
-    import fcntl
-except ImportError:  # Windows fallback
-    fcntl = None  # type: ignore[assignment]
+from typing import Dict, Optional
 
 
 DEFAULT_GLOBAL_PROMPT = """# AI Agent Collaboration Guide — `{{OWNER}}/{{REPO}}`
@@ -97,72 +87,28 @@ DEFAULT_TODO_TEMPLATE = """# TODO List — `{{OWNER}}/{{REPO}}`
 """
 
 
-def _safe_repo_key(owner: str, repo: str) -> str:
-    return f"{owner}__{repo}".replace("/", "_")
 
 
-def _atomic_write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+def _repo_key(owner: str, repo: str) -> str:
+    return f"{owner}/{repo}"
 
 
 class ContentStore:
-    """Thread-safe and multi-process-safe file store for prompts and TODO lists."""
+    """Stateless/in-memory store for prompts and TODO lists.
 
-    def __init__(self, data_dir: Path) -> None:
-        self.base_dir = data_dir / "content"
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+    Writes nothing to local disk. Admin updates live in process memory.
+    """
+
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._lockfile = self.base_dir / ".store.lock"
-
-    @contextlib.contextmanager
-    def _locked(self) -> Iterator[None]:
-        with self._lock:
-            if fcntl is None:
-                yield
-                return
-            self._lockfile.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._lockfile, "a+", encoding="utf-8") as lf:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-
-    def _global_prompt_path(self) -> Path:
-        return self.base_dir / "global_prompt.json"
-
-    def _repo_prompt_path(self, owner: str, repo: str) -> Path:
-        return self.base_dir / "prompts" / f"{_safe_repo_key(owner, repo)}.json"
-
-    def _repo_todo_path(self, owner: str, repo: str) -> Path:
-        return self.base_dir / "todos" / f"{_safe_repo_key(owner, repo)}.json"
-
-    def _read_entry(self, path: Path) -> Optional[dict]:
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+        self._global_prompt: Optional[dict] = None
+        self._repo_prompts: Dict[str, dict] = {}
+        self._repo_todos: Dict[str, dict] = {}
 
     def get_global_prompt(self) -> dict:
-        with self._locked():
-            entry = self._read_entry(self._global_prompt_path())
-            if entry is not None:
-                return entry
+        with self._lock:
+            if self._global_prompt is not None:
+                return dict(self._global_prompt)
             return {
                 "content": DEFAULT_GLOBAL_PROMPT,
                 "updated_at": None,
@@ -175,18 +121,18 @@ class ContentStore:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "is_default": False,
         }
-        with self._locked():
-            _atomic_write_json(self._global_prompt_path(), entry)
-        return entry
+        with self._lock:
+            self._global_prompt = entry
+        return dict(entry)
 
     def get_repo_prompt(self, owner: str, repo: str) -> dict:
-        with self._locked():
-            repo_entry = self._read_entry(self._repo_prompt_path(owner, repo))
+        key = _repo_key(owner, repo)
+        with self._lock:
+            repo_entry = self._repo_prompts.get(key)
             if repo_entry is not None:
                 return {**repo_entry, "scope": "repo"}
-            global_entry = self._read_entry(self._global_prompt_path())
-            if global_entry is not None:
-                return {**global_entry, "scope": "global"}
+            if self._global_prompt is not None:
+                return {**self._global_prompt, "scope": "global"}
             return {
                 "content": DEFAULT_GLOBAL_PROMPT,
                 "updated_at": None,
@@ -195,29 +141,28 @@ class ContentStore:
             }
 
     def set_repo_prompt(self, owner: str, repo: str, content: str) -> dict:
+        key = _repo_key(owner, repo)
         entry = {
             "content": content,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "is_default": False,
             "scope": "repo",
         }
-        with self._locked():
-            _atomic_write_json(self._repo_prompt_path(owner, repo), entry)
-        return entry
+        with self._lock:
+            self._repo_prompts[key] = entry
+        return dict(entry)
 
     def delete_repo_prompt(self, owner: str, repo: str) -> bool:
-        with self._locked():
-            path = self._repo_prompt_path(owner, repo)
-            if path.exists():
-                path.unlink()
-                return True
-            return False
+        key = _repo_key(owner, repo)
+        with self._lock:
+            return self._repo_prompts.pop(key, None) is not None
 
     def get_todo(self, owner: str, repo: str) -> dict:
-        with self._locked():
-            entry = self._read_entry(self._repo_todo_path(owner, repo))
+        key = _repo_key(owner, repo)
+        with self._lock:
+            entry = self._repo_todos.get(key)
             if entry is not None:
-                return entry
+                return dict(entry)
             return {
                 "content": DEFAULT_TODO_TEMPLATE,
                 "updated_at": None,
@@ -225,11 +170,12 @@ class ContentStore:
             }
 
     def set_todo(self, owner: str, repo: str, content: str) -> dict:
+        key = _repo_key(owner, repo)
         entry = {
             "content": content,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "is_default": False,
         }
-        with self._locked():
-            _atomic_write_json(self._repo_todo_path(owner, repo), entry)
-        return entry
+        with self._lock:
+            self._repo_todos[key] = entry
+        return dict(entry)

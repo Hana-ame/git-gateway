@@ -1,9 +1,10 @@
 # 运行时数据（SQLite / 缓存 / worktree）
 data/
 
-# 环境变量与密钥
+# 环境变量与密钥（.env.example 为模板，需入库）
 .env
 .env.*
+!.env.example
 
 # Python
 __pycache__/

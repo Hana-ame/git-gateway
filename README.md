@@ -1,5 +1,7 @@
 # git-gateway — 零权限 AI Agent 众包中转网关
 
+[![CI](https://github.com/Hana-ame/git-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Hana-ame/git-gateway/actions/workflows/ci.yml)
+
 面向「个人账号建库 + 对外零写权限 + 外部 AI Agent 通过阅读单个 URL 自助协作」场景从零重构的轻量级中转网关。
 
 ## 核心工作流
@@ -29,7 +31,7 @@
 ## 相比旧版 `gitproxy` 的架构改进
 
 1. **彻底关闭 `git-receive-pack`（只读克隆代理）**：杜绝匿名任意建分支、删分支、force-push 风险；所有写入必须经 `POST /patches` 并被服务端强制约束在 `<nickname>/<original_branch>` 命名空间下。
-2. **原生 Agent 引导页 + 独立 TODO 端点**：支持路径别名映射（如 `path/to/repo -> Hana-ame/repo`），Admin 可通过带 Token 的 API 随时热更新全局/单库通用说明与 TODO 列表，原子持久化落盘。
+2. **原生 Agent 引导页 + 独立 TODO 端点**：支持路径别名映射（如 `path/to/repo -> Hana-ame/repo`），Admin 可通过带 Token 的 API 随时热更新全局/单库通用说明与 TODO 列表；内容仅存于进程内存，**不落任何本地磁盘**（重启后回到默认模板，可用 Admin API 重新下发）。
 3. **内置 CI/CD 真实错误日志拉取**：不仅返回 `check_runs` 状态，还直接通过 GitHub REST API 拉取失败 Job 日志（安全处理 302 跳转，不向外部 Blob 泄露 Token），自动清除 ANSI 转义符并支持 `?tail=200`。
 4. **防 CI 投毒与隔离 Worktree**：默认拦截任何修改 `.github/workflows/*` 与 `.github/actions/*` 的 Patch；每次提交在临时 Worktree 中执行，失败不污染本地 Mirror。
 5. **零 `gh` CLI / SSH 依赖**：纯 `GITHUB_TOKEN` + HTTPS + GitHub REST API v3，支持 Docker / systemd 一键部署。
@@ -44,7 +46,8 @@ pip install -r requirements.txt
 export GITHUB_TOKEN="ghp_your_token_with_repo_and_actions_read"
 export ADMIN_TOKEN="your_strong_admin_secret"
 export PUBLIC_BASE_URL="https://proxy.com"
-export ALLOWED_REPOS="Hana-ame/repo"
+# 白名单：gitignore 风格规则文件（支持热重载）；也可用旧写法 ALLOWED_REPOS="Hana-ame/repo"
+export REPO_RULES_FILE="./repos.txt"
 export REPO_ALIASES="path/to/repo=Hana-ame/repo"
 
 python main.py --host 0.0.0.0 --port 8000

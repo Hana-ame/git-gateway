@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from fastapi.testclient import TestClient
 
 from gateway.app import create_app
-from gateway.config import Settings
+from gateway.config import RepoRuleMatcher, Settings
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -239,12 +239,12 @@ class GitGatewayTestSuite(unittest.TestCase):
 
         self.settings = Settings(
             public_base_url="https://proxy.example.com",
-            data_dir=self.tmp / "gateway_data",
+            temp_dir=self.tmp / "gateway_tmp",
             github_token="test-gh-token",
             admin_token="secret-admin-token",
             github_web_base=f"file://{self.upstream_root}",
             github_api_base=self.mock_url,
-            allowed_repos=["Hana-ame/repo"],
+            repo_rules=["Hana-ame/repo"],
             repo_aliases={"path/to/repo": "Hana-ame/repo"},
             allow_gh_cli_fallback=False,
         )
@@ -303,26 +303,25 @@ class GitGatewayTestSuite(unittest.TestCase):
         )
         self.assertEqual(r_prompt.status_code, 200)
 
-        # Re-instantiate app from same data_dir to verify disk persistence across restarts
-        client2 = TestClient(create_app(self.settings))
-        r_landing2 = client2.get("/path/to/repo")
+        # Verify in-memory prompt & TODO update on same app instance (zero local disk storage)
+        r_landing2 = self.client.get("/path/to/repo")
         self.assertIn("Custom guide for Hana-ame/repo", r_landing2.text)
         self.assertIn("Fix calculator bug", r_landing2.text)
 
         # Delete per-repo override -> falls back to global prompt
         self.assertEqual(
-            client2.delete("/admin/path/to/repo/prompt", headers=headers).status_code, 200
+            self.client.delete("/admin/path/to/repo/prompt", headers=headers).status_code, 200
         )
-        self.assertIn("Step 1", client2.get("/path/to/repo").text)
+        self.assertIn("Step 1", self.client.get("/path/to/repo").text)
 
     # 2. Read-only Git Smart-HTTP clone proxy
     def test_02_readonly_clone_proxy_allows_fetch_blocks_push(self) -> None:
         proxy_settings = Settings(
-            data_dir=self.tmp / "proxy_data",
+            temp_dir=self.tmp / "proxy_tmp",
             github_token="test-gh-token",
             github_web_base=self.mock_url,
             github_api_base=self.mock_url,
-            allowed_repos=["Hana-ame/repo"],
+            repo_rules=["Hana-ame/repo"],
             repo_aliases={"path/to/repo": "Hana-ame/repo"},
             allow_gh_cli_fallback=False,
         )
@@ -500,11 +499,11 @@ class GitGatewayTestSuite(unittest.TestCase):
 
         # Oversized patch -> 413
         small_settings = Settings(
-            data_dir=self.tmp / "small_data",
+            temp_dir=self.tmp / "small_tmp",
             github_token="test-gh-token",
             github_web_base=f"file://{self.upstream_root}",
             github_api_base=self.mock_url,
-            allowed_repos=["Hana-ame/repo"],
+            repo_rules=["Hana-ame/repo"],
             max_patch_bytes=64,
             allow_gh_cli_fallback=False,
         )
@@ -598,10 +597,23 @@ class GitGatewayTestSuite(unittest.TestCase):
         commit_count = int(_git(["rev-list", "--count", "main..refs/heads/shared-bot/main"], cwd=self.bare_repo))
         self.assertEqual(commit_count, 3)
 
-        # Verify no dangling worktrees remain on the bare mirror
-        mirror = self.settings.data_dir / "mirrors" / "Hana-ame__repo.git"
-        wt_list = _git(["worktree", "list"], cwd=mirror).splitlines()
-        self.assertEqual(len(wt_list), 1, f"dangling worktrees found: {wt_list}")
+        # Verify zero leftover ephemeral temp directories in temp_dir/work
+        work_dir = self.settings.temp_dir / "work"
+        leftovers = list(work_dir.iterdir()) if work_dir.exists() else []
+        self.assertEqual(leftovers, [], f"leftover temp workspaces found: {leftovers}")
+
+    # 7. Gitignore-style repos.txt allow/disallow matcher (last match wins + hot reload)
+    def test_07_gitignore_style_repo_rules_and_hot_reload(self) -> None:
+        rules_file = self.tmp / "repos.txt"
+        rules_file.write_text(
+            "# comment\n\nHana-ame/*\n!Hana-ame/private-*\nHana-ame/private-demo\n",
+            encoding="utf-8",
+        )
+        matcher = RepoRuleMatcher(rules_file=rules_file)
+        self.assertTrue(matcher.is_allowed("Hana-ame", "repo"))
+        self.assertFalse(matcher.is_allowed("Hana-ame", "private-secret"))
+        self.assertTrue(matcher.is_allowed("Hana-ame", "private-demo"))
+        self.assertFalse(matcher.is_allowed("other-org", "repo"))  # default disallow
 
 
 if __name__ == "__main__":

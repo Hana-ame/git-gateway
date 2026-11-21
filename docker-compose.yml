@@ -1,0 +1,30 @@
+services:
+  git-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: git-gateway:latest
+    container_name: git-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8000"
+      REPO_RULES_FILE: "/app/repos.txt"
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      # 仅只读挂载白名单/黑名单规则文件（支持热重载），不挂载任何本地数据持久化目录
+      - ./repos.txt:/app/repos.txt:ro
+    tmpfs:
+      # 临时文件全部落在内存 tmpfs (/tmp)，容器重启自动清空，零磁盘残留
+      - /tmp:rw,noexec,nosuid,size=512m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

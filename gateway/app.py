@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import secrets
@@ -94,16 +95,26 @@ def _format_logs_as_text(data: dict[str, Any]) -> str:
 
 
 def create_app(settings: Settings) -> FastAPI:
+    store = ContentStore()
+    gh = GitHubClient(settings)
+    git_engine = GitPatchEngine(settings)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Warm up token cache at startup so request handlers never block on subprocess
+        settings.resolve_github_token()
+        try:
+            yield
+        finally:
+            await gh.aclose()
+
     app = FastAPI(
         title="git-gateway",
         version=__version__,
         docs_url=None,
         redoc_url=None,
+        lifespan=lifespan,
     )
-
-    store = ContentStore(settings.data_dir)
-    gh = GitHubClient(settings)
-    git_engine = GitPatchEngine(settings)
 
     app.state.settings = settings
     app.state.store = store
@@ -121,7 +132,8 @@ def create_app(settings: Settings) -> FastAPI:
             {
                 "service": "git-gateway",
                 "version": __version__,
-                "allowed_repos": settings.allowed_repos,
+                "repo_rules_file": str(settings.repo_rules_file) if settings.repo_rules_file else None,
+                "repo_rules_count": len(settings.active_rules()),
                 "repo_aliases": settings.repo_aliases,
                 "usage": {
                     "agent_instructions": f"GET {base}/<repo_path>",
@@ -148,8 +160,11 @@ def create_app(settings: Settings) -> FastAPI:
                 "version": __version__,
                 "github_token_configured": bool(settings.resolve_github_token()),
                 "admin_token_configured": bool(settings.admin_token),
-                "allowed_repos": settings.allowed_repos,
+                "repo_rules_file": str(settings.repo_rules_file) if settings.repo_rules_file else None,
+                "repo_rules_count": len(settings.active_rules()),
                 "repo_aliases": settings.repo_aliases,
+                "temp_dir": str(settings.temp_dir),
+                "local_storage": "none (in-memory + OS temp dir only)",
             }
         )
 

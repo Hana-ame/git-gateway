@@ -44,6 +44,22 @@ class GitHubClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                http2=False,
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                timeout=httpx.Timeout(connect=15.0, read=45.0, write=30.0, pool=15.0),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     def _headers(self) -> Dict[str, str]:
         headers = {
@@ -66,14 +82,18 @@ class GitHubClient:
         timeout: float = 30.0,
     ) -> httpx.Response:
         url = f"{self.settings.github_api_base}{path}"
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        client = self._get_client()
+        try:
             resp = await client.request(
                 method,
                 url,
                 headers=self._headers(),
                 params=params,
                 json=json_body,
+                timeout=timeout,
             )
+        except httpx.HTTPError as exc:
+            raise GitHubAPIError(502, f"GitHub network error: {exc}") from exc
         if resp.status_code >= 400:
             detail = resp.text[:500]
             try:
@@ -219,14 +239,17 @@ class GitHubClient:
     ) -> str:
         """Fetch raw Actions job logs, following redirect without leaking auth token."""
         url = f"{self.settings.github_api_base}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
-        async with httpx.AsyncClient(timeout=45.0, follow_redirects=False) as client:
-            resp = await client.get(url, headers=self._headers())
+        client = self._get_client()
+        try:
+            resp = await client.get(url, headers=self._headers(), timeout=45.0)
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("location")
                 if not loc:
                     raise GitHubAPIError(502, "missing redirect location for job logs")
                 # Do NOT forward GitHub Bearer token to external pre-signed blob URL
-                resp = await client.get(loc, headers={"User-Agent": "git-gateway/2.0"})
+                resp = await client.get(loc, headers={"User-Agent": "git-gateway/2.0"}, timeout=45.0)
+        except httpx.HTTPError as exc:
+            raise GitHubAPIError(502, f"GitHub log fetch network error: {exc}") from exc
             if resp.status_code >= 400:
                 raise GitHubAPIError(resp.status_code, resp.text[:400])
             clean = strip_ansi(resp.text)

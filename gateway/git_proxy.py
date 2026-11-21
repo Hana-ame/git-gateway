@@ -77,8 +77,12 @@ async def handle_git_smart_http(
 
     body = await request.body() if request.method == "POST" else None
 
-    # Disable HTTP/2 to avoid backend pack stream truncation on large clones
-    client = httpx.AsyncClient(http2=False, timeout=httpx.Timeout(600.0, connect=30.0))
+    # Use HTTP/1.1 with generous read/write timeouts and keep content-encoding intact for aiter_raw()
+    client = httpx.AsyncClient(
+        http2=False,
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=30.0, read=600.0, write=120.0, pool=30.0),
+    )
     req = client.build_request(
         method=request.method,
         url=upstream_url,
@@ -94,10 +98,11 @@ async def handle_git_smart_http(
             content={"ok": False, "error": f"upstream git clone proxy error: {exc}"},
         )
 
+    # Preserve content-encoding since we stream raw bytes via aiter_raw()
     resp_headers = {
         k: v
         for k, v in upstream_resp.headers.items()
-        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "content-encoding"
+        if k.lower() not in HOP_BY_HOP_HEADERS
     }
 
     async def stream_body() -> AsyncIterator[bytes]:

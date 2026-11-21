@@ -1,4 +1,4 @@
-"""Isolated Git patch-application engine with per-repo thread + cross-process (flock) locking."""
+"""Ephemeral Git patch-application engine using OS temp dir (/tmp or Windows %TEMP%)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import contextlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 try:
     import fcntl
@@ -49,6 +50,19 @@ class ApplyResult:
     elapsed_ms: int
 
 
+def _force_rmtree(path: Path) -> None:
+    """Remove directory tree safely on both POSIX and Windows (clears read-only .git objects)."""
+    def _on_error(func: Any, p: str, _exc: Any) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            func(p)
+        except OSError:
+            pass
+
+    if path.exists():
+        shutil.rmtree(path, onerror=_on_error)
+
+
 def extract_touched_paths(patch_text: str) -> List[str]:
     """Parse all file paths referenced by a unified diff or format-patch."""
     paths: Set[str] = set()
@@ -81,22 +95,20 @@ def detect_base_commit(patch_text: str) -> Optional[str]:
 
 
 class GitPatchEngine:
-    """Applies patches in ephemeral worktrees backed by per-repo bare mirrors.
+    r"""Applies patches inside ephemeral OS temp directories with zero local persistence.
 
-    Concurrency model:
-      - In-process: per-repo `threading.Lock` serializes concurrent worker threads
-        targeting the same repository while allowing distinct repositories to run
-        in parallel.
-      - Cross-process: per-repo POSIX `fcntl.flock` lockfile guarantees safety
-        even when deployed behind multi-worker Uvicorn (`--workers N`).
-      - Isolation: every submission runs in a fresh `mkdtemp` detached worktree
-        that is always removed and pruned in `finally`.
+    All temporary bare clones, worktrees, patch files, and lockfiles live strictly under
+    `settings.temp_dir` (defaults to `/tmp/git-gateway` on Linux/macOS or `%TEMP%\git-gateway`
+    on Windows) and every request workspace is deleted immediately in `finally`.
     """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.mirrors_dir = settings.data_dir / "mirrors"
-        self.mirrors_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_root = settings.temp_dir
+        self.locks_dir = self.temp_root / "locks"
+        self.work_dir = self.temp_root / "work"
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         self._locks_guard = threading.Lock()
         self._repo_locks: Dict[str, threading.Lock] = {}
 
@@ -110,7 +122,7 @@ class GitPatchEngine:
     @contextlib.contextmanager
     def _repo_lock(self, owner: str, repo: str) -> Iterator[None]:
         tlock = self._repo_thread_lock(owner, repo)
-        lock_path = self.mirrors_dir / f"{owner}__{repo}.lock"
+        lock_path = self.locks_dir / f"{owner}__{repo}.lock"
         with tlock:
             if fcntl is None:
                 yield
@@ -166,34 +178,15 @@ class GitPatchEngine:
         except subprocess.TimeoutExpired:
             return -1, "git command timed out"
 
-    def _ensure_mirror(self, owner: str, repo: str) -> Path:
-        mirror_path = self.mirrors_dir / f"{owner}__{repo}.git"
+    def _clone_ephemeral_bare(self, owner: str, repo: str, dest: Path) -> Path:
         remote_url = self._remote_url(owner, repo)
-        if not (mirror_path / "HEAD").exists():
-            if mirror_path.exists():
-                shutil.rmtree(mirror_path, ignore_errors=True)
-            code, out = self._run_git(
-                ["clone", "--bare", remote_url, str(mirror_path)],
-                with_auth=True,
-            )
-            if code != 0:
-                shutil.rmtree(mirror_path, ignore_errors=True)
-                raise PatchValidationError(502, "upstream clone failed", out.strip())
-            self._run_git(
-                ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
-                cwd=mirror_path,
-            )
-        else:
-            self._run_git(["remote", "set-url", "origin", remote_url], cwd=mirror_path)
-
         code, out = self._run_git(
-            ["fetch", "origin", "--prune", "--quiet"],
-            cwd=mirror_path,
+            ["clone", "--bare", remote_url, str(dest)],
             with_auth=True,
         )
         if code != 0:
-            raise PatchValidationError(502, "upstream fetch failed", out.strip())
-        return mirror_path
+            raise PatchValidationError(502, "upstream clone failed", out.strip())
+        return dest
 
     def _ref_sha(self, repo_dir: Path, ref: str) -> Optional[str]:
         code, out = self._run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=repo_dir)
@@ -238,43 +231,46 @@ class GitPatchEngine:
         detected_base = base_commit or detect_base_commit(patch_text)
 
         with self._repo_lock(owner, repo):
-            mirror = self._ensure_mirror(owner, repo)
-
-            base_branch_sha = (
-                self._ref_sha(mirror, f"refs/remotes/origin/{base_branch}")
-                or self._ref_sha(mirror, f"refs/heads/{base_branch}")
-            )
-            if not base_branch_sha:
-                raise PatchValidationError(
-                    400,
-                    "base_branch not found",
-                    f"branch '{base_branch}' does not exist on {owner}/{repo}",
-                )
-
-            existing_target_sha = (
-                self._ref_sha(mirror, f"refs/remotes/origin/{target_branch}")
-                or self._ref_sha(mirror, f"refs/heads/{target_branch}")
-            )
-
-            resolved_base_sha = base_branch_sha
-            if detected_base:
-                cand = self._ref_sha(mirror, detected_base)
-                if cand:
-                    resolved_base_sha = cand
-
-            tmp_root = Path(tempfile.mkdtemp(prefix="ggw-work-"))
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            tmp_root = Path(tempfile.mkdtemp(prefix="ggw-req-", dir=str(self.work_dir)))
+            bare_dir = tmp_root / "bare.git"
             workdir = tmp_root / "wt"
             patch_file = tmp_root / "submit.patch"
-            normalized_patch = patch_text.replace("\r\n", "\n")
-            if normalized_patch and not normalized_patch.endswith("\n"):
-                normalized_patch += "\n"
-            patch_file.write_text(normalized_patch, encoding="utf-8")
 
             try:
+                self._clone_ephemeral_bare(owner, repo, bare_dir)
+
+                base_branch_sha = (
+                    self._ref_sha(bare_dir, f"refs/heads/{base_branch}")
+                    or self._ref_sha(bare_dir, f"refs/remotes/origin/{base_branch}")
+                )
+                if not base_branch_sha:
+                    raise PatchValidationError(
+                        400,
+                        "base_branch not found",
+                        f"branch '{base_branch}' does not exist on {owner}/{repo}",
+                    )
+
+                existing_target_sha = (
+                    self._ref_sha(bare_dir, f"refs/heads/{target_branch}")
+                    or self._ref_sha(bare_dir, f"refs/remotes/origin/{target_branch}")
+                )
+
+                resolved_base_sha = base_branch_sha
+                if detected_base:
+                    cand = self._ref_sha(bare_dir, detected_base)
+                    if cand:
+                        resolved_base_sha = cand
+
+                normalized_patch = patch_text.replace("\r\n", "\n")
+                if normalized_patch and not normalized_patch.endswith("\n"):
+                    normalized_patch += "\n"
+                patch_file.write_text(normalized_patch, encoding="utf-8")
+
                 start_sha = existing_target_sha or resolved_base_sha
                 code, out = self._run_git(
                     ["worktree", "add", "--detach", str(workdir), start_sha],
-                    cwd=mirror,
+                    cwd=bare_dir,
                 )
                 if code != 0:
                     raise PatchValidationError(500, "failed to create worktree", out.strip())
@@ -300,11 +296,7 @@ class GitPatchEngine:
                             self._run_git(["clean", "-fdq"], cwd=workdir)
                             ok, apply_err = self._try_apply(workdir, patch_file, use_three_way=True)
                         if not ok:
-                            raise PatchValidationError(
-                                400,
-                                "patch does not apply cleanly",
-                                apply_err,
-                            )
+                            raise PatchValidationError(400, "patch does not apply cleanly", apply_err)
                 else:
                     ok, apply_err = self._try_apply(workdir, patch_file, use_three_way=False)
                     if not ok:
@@ -312,11 +304,7 @@ class GitPatchEngine:
                         self._run_git(["clean", "-fdq"], cwd=workdir)
                         ok, apply_err = self._try_apply(workdir, patch_file, use_three_way=True)
                     if not ok:
-                        raise PatchValidationError(
-                            400,
-                            "patch does not apply cleanly",
-                            apply_err,
-                        )
+                        raise PatchValidationError(400, "patch does not apply cleanly", apply_err)
 
                 self._run_git(["add", "-A"], cwd=workdir)
 
@@ -330,14 +318,13 @@ class GitPatchEngine:
                     ["rev-parse", f"{parent_sha}^{{tree}}"], cwd=workdir
                 )
                 if parent_tree_code == 0 and parent_tree_out.strip() == new_tree:
-                    short = parent_sha[:7]
                     return ApplyResult(
                         status="noop",
                         target_branch=target_branch,
                         base_branch=base_branch,
                         base_commit=resolved_base_sha,
                         commit_sha=parent_sha,
-                        commit_short=short,
+                        commit_short=parent_sha[:7],
                         elapsed_ms=int((time.monotonic() - t0) * 1000),
                     )
 
@@ -357,20 +344,14 @@ class GitPatchEngine:
                 if c_code != 0:
                     raise PatchValidationError(500, "git commit-tree failed", c_out.strip())
                 new_sha = c_out.strip()
-                short_sha = new_sha[:7]
 
                 p_code, p_out = self._run_git(
                     ["push", "origin", f"{new_sha}:refs/heads/{target_branch}"],
-                    cwd=mirror,
+                    cwd=bare_dir,
                     with_auth=True,
                 )
                 if p_code != 0:
                     raise PatchValidationError(502, "push to upstream failed", p_out.strip())
-
-                self._run_git(
-                    ["update-ref", f"refs/remotes/origin/{target_branch}", new_sha],
-                    cwd=mirror,
-                )
 
                 return ApplyResult(
                     status="pushed",
@@ -378,10 +359,8 @@ class GitPatchEngine:
                     base_branch=base_branch,
                     base_commit=resolved_base_sha,
                     commit_sha=new_sha,
-                    commit_short=short_sha,
+                    commit_short=new_sha[:7],
                     elapsed_ms=int((time.monotonic() - t0) * 1000),
                 )
             finally:
-                self._run_git(["worktree", "remove", "--force", str(workdir)], cwd=mirror)
-                self._run_git(["worktree", "prune"], cwd=mirror)
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                _force_rmtree(tmp_root)
