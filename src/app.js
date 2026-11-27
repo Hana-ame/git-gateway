@@ -9,8 +9,9 @@ const { GitPatchEngine, PatchValidationError } = require('./gitOps');
 const { handleGitSmartHttp, readBoundedBody } = require('./gitProxy');
 const { validatePatchSubmission } = require('./models');
 const { renderAgentLanding, renderTodoPage } = require('./promptRenderer');
+const { renderAdminHtml } = require('./adminUi');
 
-const VERSION = '3.0.0-node';
+const VERSION = '3.1.0-node';
 const PR_CI_RE = /^prs\/(\d+)\/ci$/;
 const PR_LOGS_RE = /^prs\/(\d+)\/logs$/;
 const JOB_LOGS_RE = /^actions\/jobs\/(\d+)\/logs$/;
@@ -278,6 +279,8 @@ function createGatewayHandler(settings) {
           runtime: 'node',
           github_token_configured: Boolean(settings.resolveGithubToken()),
           github_token_source: settings.tokenSource(),
+          github_token_hint: settings.tokenHint(),
+          gh_config_dir: settings.ghConfigDir,
           admin_token_configured: Boolean(settings.adminToken),
           repo_rules_file: settings.repoRulesFile,
           repo_rules_count: settings.activeRules().length,
@@ -339,7 +342,16 @@ function createGatewayHandler(settings) {
         });
       }
 
-      // 2. Admin endpoints
+      // 2. Admin endpoints (HTML UI on GET /admin or /admin/ with Accept: text/html)
+      if (
+        (pathname === '/admin' || pathname === '/admin/') &&
+        method === 'GET' &&
+        !wantsJson(req, urlObj) &&
+        String(req.headers.accept || '').toLowerCase().includes('text/html')
+      ) {
+        return sendText(res, 200, renderAdminHtml(), 'text/html; charset=utf-8');
+      }
+
       if (pathname === '/admin/prompt') {
         const auth = verifyAdmin(req, settings);
         if (!auth.ok) return sendJson(res, auth.status, { ok: false, detail: auth.error });

@@ -142,6 +142,26 @@ test('Node git-gateway end-to-end: /repos, admin persistence, clone proxy guardr
     assert.equal(reposRes.repos[0].id, 'alice/demo');
     assert.deepEqual(reposRes.repos[0].aliases, ['p/demo']);
 
+    // Explicitly excluded repo (!alice/secret) must reject direct requests with 403
+    const secretTodo = await fetch(`${gwUrl}/alice/secret/todo`);
+    assert.equal(secretTodo.status, 403);
+    const secretPatch = await fetch(`${gwUrl}/alice/secret/patches`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: 'bot1', base_branch: 'main', message: 'nope', patch: 'diff --git a/a b/a\n' }),
+    });
+    assert.equal(secretPatch.status, 403);
+
+    // Admin HTML UI serves on Accept: text/html without leaking token, while JSON API stays 401
+    const adminHtml = await fetch(`${gwUrl}/admin/`, { headers: { Accept: 'text/html' } });
+    assert.equal(adminHtml.status, 200);
+    assert.match(adminHtml.headers.get('content-type') || '', /text\/html/);
+    const adminHtmlBody = await adminHtml.text();
+    assert.match(adminHtmlBody, /git-gateway/);
+    assert.equal(adminHtmlBody.includes('admin-secret'), false);
+    const adminApiCheck = await fetch(`${gwUrl}/admin/`, { headers: { Accept: 'application/json' } });
+    assert.equal(adminApiCheck.status, 401);
+
     // B. Admin auth & persistence
     const unauth = await fetch(`${gwUrl}/admin/alice/demo/todo`, { method: 'PUT', body: '- task 1' });
     assert.equal(unauth.status, 401);
@@ -226,5 +246,44 @@ test('Node git-gateway end-to-end: /repos, admin persistence, clone proxy guardr
     await closeServer(gwServer);
     await closeServer(mockGh);
     await fsp.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('Settings resolves GitHub token from host gh hosts.yml without gh binary, falls back to env, and emits hint when missing', async () => {
+  const tmpGh = await fsp.mkdtemp(path.join(os.tmpdir(), 'ggw-gh-yml-'));
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+
+  try {
+    fs.writeFileSync(
+      path.join(tmpGh, 'hosts.yml'),
+      'github.com:\n    oauth_token: gho_borrowed_from_hosts_yml\n    user: tester\n',
+      'utf-8'
+    );
+    const s1 = new Settings({ ghConfigDir: tmpGh, ghCliPath: 'nonexistent-gh-bin-xyz', useGhCli: true });
+    assert.equal(s1.resolveGithubToken(), 'gho_borrowed_from_hosts_yml');
+    assert.equal(s1.tokenSource(), 'gh_hosts_yml');
+    assert.equal(s1.tokenHint(), null);
+
+    // Missing hosts.yml + missing gh CLI -> falls back to env token
+    process.env.GH_TOKEN = 'ghp_env_fallback_token';
+    const emptyGh = path.join(tmpGh, 'empty');
+    fs.mkdirSync(emptyGh);
+    const s2 = new Settings({ ghConfigDir: emptyGh, ghCliPath: 'nonexistent-gh-bin-xyz', useGhCli: true });
+    assert.equal(s2.resolveGithubToken(), 'ghp_env_fallback_token');
+    assert.equal(s2.tokenSource(), 'env/arg');
+
+    // Missing both -> clear hint
+    delete process.env.GH_TOKEN;
+    const s3 = new Settings({ ghConfigDir: emptyGh, ghCliPath: 'nonexistent-gh-bin-xyz', useGhCli: true });
+    assert.equal(s3.resolveGithubToken(), '');
+    assert.equal(s3.tokenSource(), 'none');
+    assert.match(s3.tokenHint() || '', /GH_HOST_CONFIG_DIR|GH_TOKEN/);
+  } finally {
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+    await fsp.rm(tmpGh, { recursive: true, force: true });
   }
 });

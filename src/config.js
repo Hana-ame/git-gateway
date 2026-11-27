@@ -175,6 +175,37 @@ function parseRepoAliases(raw) {
   return aliases;
 }
 
+function parseGhHostsToken(hostsFile, targetHost = 'github.com') {
+  try {
+    if (!hostsFile || !fs.existsSync(hostsFile)) return '';
+    const text = fs.readFileSync(hostsFile, 'utf-8');
+    let inTargetHost = false;
+    let hostIndent = -1;
+    for (const rawLine of text.split(/\r?\n/)) {
+      if (!rawLine.trim() || rawLine.trim().startsWith('#')) continue;
+      const indent = rawLine.length - rawLine.trimStart().length;
+      const trimmed = rawLine.trim();
+      if (/^[A-Za-z0-9_.-]+:\s*$/.test(trimmed) && indent === 0) {
+        inTargetHost = trimmed.slice(0, -1).toLowerCase() === targetHost.toLowerCase();
+        hostIndent = indent;
+        continue;
+      }
+      if (inTargetHost && indent <= hostIndent) {
+        inTargetHost = false;
+      }
+      if (inTargetHost) {
+        const m = /^oauth_token:\s*(.+)$/.exec(trimmed);
+        if (m) {
+          return m[1].replace(/^['"]|['"]$/g, '').trim();
+        }
+      }
+    }
+  } catch {
+    // ignore missing or unreadable gh hosts.yml
+  }
+  return '';
+}
+
 class Settings {
   constructor(overrides = {}) {
     this.host = overrides.host ?? process.env.GATEWAY_HOST ?? '127.0.0.1';
@@ -182,9 +213,12 @@ class Settings {
     this.publicBaseUrl = (overrides.publicBaseUrl ?? process.env.PUBLIC_BASE_URL ?? '').replace(/\/+$/, '');
     this.trustProxyHeaders = overrides.trustProxyHeaders ?? parseBoolEnv('TRUST_PROXY_HEADERS', true);
 
+    this.explicitGithubToken = overrides.githubToken !== undefined ? overrides.githubToken : null;
     this.githubToken = overrides.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? '';
     this.useGhCli = overrides.useGhCli ?? parseBoolEnv('USE_GH_CLI', true);
     this.allowGhCliFallback = overrides.allowGhCliFallback ?? true;
+    this.ghConfigDir = overrides.ghConfigDir ?? process.env.GH_CONFIG_DIR ?? path.join(os.homedir(), '.config', 'gh');
+    this.ghCliPath = overrides.ghCliPath ?? process.env.GH_CLI_PATH ?? 'gh';
     this.githubWebBase = (overrides.githubWebBase ?? process.env.GITHUB_WEB_BASE ?? 'https://github.com').replace(/\/+$/, '');
     this.githubApiBase = (overrides.githubApiBase ?? process.env.GITHUB_API_BASE ?? 'https://api.github.com').replace(/\/+$/, '');
 
@@ -235,15 +269,23 @@ class Settings {
   }
 
   resolveGithubToken() {
-    if (this.githubToken) {
+    if (this.explicitGithubToken) {
       this._tokenSource = 'env/arg';
-      return this.githubToken;
+      return this.explicitGithubToken;
     }
     if (this._tokenResolved) return this._cachedToken;
     this._tokenResolved = true;
+
+    // 1. Prefer borrowing host gh credentials (hosts.yml mount or GH_CLI_PATH / gh CLI)
     if (this.useGhCli && this.allowGhCliFallback) {
+      const yamlToken = parseGhHostsToken(path.join(this.ghConfigDir, 'hosts.yml'));
+      if (yamlToken) {
+        this._cachedToken = yamlToken;
+        this._tokenSource = 'gh_hosts_yml';
+        return yamlToken;
+      }
       try {
-        const out = execFileSync('gh', ['auth', 'token'], {
+        const out = execFileSync(this.ghCliPath, ['auth', 'token'], {
           encoding: 'utf-8',
           timeout: 5000,
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -257,6 +299,14 @@ class Settings {
         // gh not installed or not logged in
       }
     }
+
+    // 2. Fallback to explicit API key env (GH_TOKEN / GITHUB_TOKEN)
+    if (this.githubToken) {
+      this._cachedToken = this.githubToken;
+      this._tokenSource = 'env/arg';
+      return this.githubToken;
+    }
+
     this._tokenSource = 'none';
     return '';
   }
@@ -264,6 +314,11 @@ class Settings {
   tokenSource() {
     this.resolveGithubToken();
     return this._tokenSource;
+  }
+
+  tokenHint() {
+    if (this.resolveGithubToken()) return null;
+    return `No GitHub token found. Mount host gh config dir (${this.ghConfigDir}/hosts.yml via GH_CONFIG_DIR / GH_HOST_CONFIG_DIR), set GH_CLI_PATH, or configure GH_TOKEN / GITHUB_TOKEN.`;
   }
 
   isPatchPathBlocked(relPath) {
