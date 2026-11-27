@@ -162,6 +162,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "repo_rules_count": len(settings.active_rules()),
                 "repo_aliases": settings.repo_aliases,
                 "usage": {
+                    "list_repos": f"GET {base}/repos",
                     "agent_instructions": f"GET {base}/<repo_path>",
                     "todo_list": f"GET {base}/<repo_path>/todo",
                     "clone_proxy_readonly": f"git clone {base}/<repo_path>.git",
@@ -193,6 +194,71 @@ def create_app(settings: Settings) -> FastAPI:
                 "temp_dir": str(settings.temp_dir),
                 "local_storage": "git worktrees in OS temp dir (deleted per request)",
                 "content_store": store.info(),
+            }
+        )
+
+    @app.get("/repos")
+    async def list_repos(request: Request) -> JSONResponse:
+        """Read-only repository catalog derived from active allow rules and aliases."""
+        base = _infer_base_url(request, settings)
+        seen: dict[str, dict[str, Any]] = {}
+
+        # Concrete owner/repo rules from repos.txt / inline rules (exclude wildcards & negated rules)
+        for raw_rule in settings.active_rules():
+            rule = raw_rule.strip().strip("/")
+            if not rule or rule.startswith("!") or any(ch in rule for ch in ("*", "?", "[")):
+                continue
+            parts = rule.split("/")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                continue
+            owner, repo = parts
+            if not settings.is_repo_allowed(owner, repo):
+                continue
+            repo_id = f"{owner}/{repo}"
+            seen[repo_id] = {
+                "id": repo_id,
+                "owner": owner,
+                "repo": repo,
+                "path": repo_id,
+                "aliases": [],
+                "todo_url": f"{base}/{repo_id}/todo",
+                "prs_url": f"{base}/{repo_id}/prs",
+            }
+
+        # Attach configured aliases (and include aliased repos if allowed by wildcard rules)
+        for alias, target in settings.repo_aliases.items():
+            cleaned_target = target.strip("/")
+            parts = cleaned_target.split("/")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                continue
+            owner, repo = parts
+            if not settings.is_repo_allowed(owner, repo):
+                continue
+            repo_id = f"{owner}/{repo}"
+            entry = seen.get(repo_id)
+            if entry is None:
+                entry = {
+                    "id": repo_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "path": alias,
+                    "aliases": [alias],
+                    "todo_url": f"{base}/{alias}/todo",
+                    "prs_url": f"{base}/{alias}/prs",
+                }
+                seen[repo_id] = entry
+            else:
+                if alias not in entry["aliases"]:
+                    entry["aliases"].append(alias)
+
+        repos = sorted(seen.values(), key=lambda item: item["id"].lower())
+        return JSONResponse(
+            {
+                "ok": True,
+                "count": len(repos),
+                "repos": repos,
+                "aliases": settings.repo_aliases,
+                "rules_count": len(settings.active_rules()),
             }
         )
 
