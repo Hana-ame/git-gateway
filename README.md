@@ -75,13 +75,9 @@ curl -s http://127.0.0.1:8000/health | jq .content_store
 
 若 `mode` 为 `memory`，说明目录不可写（常见于 `read_only` 容器忘记挂卷），此时 Admin 内容会在重启后回到内置默认模板。
 
-## 快速启动
+## 快速启动（Node.js >= 18，零依赖）
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
 # 认证：默认走已登录的 gh CLI（也可用 GITHUB_TOKEN 覆盖）
 gh auth login
 
@@ -91,7 +87,7 @@ export PUBLIC_BASE_URL="https://proxy.com"
 export REPO_RULES_FILE="./repos.txt"
 export REPO_ALIASES="path/to/repo=Hana-ame/repo"
 
-python main.py --host 0.0.0.0 --port 8000
+node index.js
 ```
 
 ## API 端点一览
@@ -136,5 +132,6 @@ curl -X PUT "https://proxy.com/admin/path/to/repo/todo" \
 ## 运行测试
 
 ```bash
-python3 -m unittest discover -s tests -v
+npm test
+# 等价于：node --test tests/gateway.test.js
 ```
