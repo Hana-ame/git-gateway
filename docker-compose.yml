@@ -1,0 +1,43 @@
+services:
+  git-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: git-gateway:latest
+    container_name: git-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8000"
+      REPO_RULES_FILE: "/app/repos.txt"
+      # Admin 下发的 prompt/TODO 落盘目录（必须指向下面的命名卷，否则重启即丢）
+      CONTENT_DIR: "/var/lib/git-gateway/content"
+      GH_CONFIG_DIR: "/home/gateway/.config/gh"
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      # 1. 只读挂载 gitignore 风格白名单/黑名单规则文件（支持热重载）
+      - ./repos.txt:/app/repos.txt:ro
+      # 2. 默认使用宿主机已登录的 gh CLI 凭据（先在宿主机执行 `gh auth login`）
+      #    如改为在 .env 中传 GITHUB_TOKEN，可注释掉下面这行
+      - ${GH_HOST_CONFIG_DIR:-~/.config/gh}:/home/gateway/.config/gh:ro
+      # 3. Admin prompt/TODO 的持久化卷：容器重建/升级后内容仍在
+      #    注意：read_only 根文件系统下，这是唯一可写的数据目录
+      - git-gateway-data:/var/lib/git-gateway
+    tmpfs:
+      # Git 克隆与 Worktree 仍全部落在内存 tmpfs (/tmp)，请求结束即删
+      - /tmp:rw,noexec,nosuid,size=512m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  git-gateway-data:
+    # 命名卷：`docker compose down` 不会删除；如需清空用 `docker compose down -v`

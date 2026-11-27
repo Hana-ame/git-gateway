@@ -1,0 +1,297 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- 语法检查
+  syntax:
+    name: Syntax / node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: node --check every source file
+        run: |
+          set -e
+          for f in index.js src/*.js tests/*.js; do
+            node --check "$f"
+            echo "✓ $f"
+          done
+
+      - name: Every module loads (no circular requires)
+        run: |
+          node -e "
+          for (const m of ['config','models','store','promptRenderer','githubClient','gitOps','gitProxy','app']) {
+            require('./src/' + m);
+            console.log('✓ src/' + m + '.js');
+          }
+          "
+
+      - name: Zero third-party dependencies
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const deps = Object.keys(pkg.dependencies || {});
+          const dev = Object.keys(pkg.devDependencies || {});
+          if (deps.length || dev.length) {
+            console.error('::error::git-gateway must stay dependency-free, got', {deps, dev});
+            process.exit(1);
+          }
+          console.log('✓ dependencies = 0');
+          "
+
+  # ---------------------------------------------------------------- 端到端测试
+  test:
+    name: Test / node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Show runtime versions
+        run: |
+          node --version
+          git --version
+
+      - name: Run node:test suite
+        run: npm test
+
+      - name: /health boots and reports content_store
+        run: |
+          set -euo pipefail
+          ADMIN_TOKEN=dummy-admin-token GITHUB_TOKEN=dummy-token GATEWAY_PORT=8123 \
+            node index.js > /tmp/gw.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8123/health > /tmp/health.json 2>/dev/null && break
+            if [ "$i" -eq 30 ]; then
+              echo "::error::gateway did not become healthy"
+              cat /tmp/gw.log
+              exit 1
+            fi
+            sleep 1
+          done
+          node -e "
+          const h = require('/tmp/health.json');
+          if (h.ok !== true) throw new Error('ok !== true');
+          if (h.runtime !== 'node') throw new Error('runtime !== node: ' + h.runtime);
+          if (h.github_token_source !== 'env/arg') throw new Error('token source: ' + h.github_token_source);
+          if (!h.content_store || !h.content_store.mode) throw new Error('content_store missing');
+          console.log('✓ /health', JSON.stringify({version: h.version, token: h.github_token_source, store: h.content_store.mode}));
+          "
+          kill %1 2>/dev/null || true
+
+  # ---------------------------------------------------------------- 容器产物
+  docker:
+    name: Docker build + smoke test
+    runs-on: ubuntu-latest
+    needs: [syntax, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env   # compose declares env_file: .env
+          docker compose -f docker-compose.yml config >/dev/null && echo "✓ compose config valid"
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: git-gateway:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot container and hit /health
+        run: |
+          set -euo pipefail
+          docker run -d --name gw \
+            -p 127.0.0.1:8000:8000 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --security-opt no-new-privileges:true \
+            -e GITHUB_TOKEN=dummy-token-for-smoke-test \
+            -e ADMIN_TOKEN=dummy-admin-token \
+            git-gateway:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && break
+            if [ "$i" -eq 30 ]; then
+              echo "::error::container did not become healthy"
+              docker logs gw
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "--- /health ---"
+          curl -fsS http://127.0.0.1:8000/health; echo
+          echo "--- runs as non-root ---"
+          docker inspect -f '{{.Config.User}}' gw
+          docker exec gw id
+          echo "--- node is the runtime ---"
+          docker exec gw node --version
+          echo "--- container logs ---"
+          docker logs gw | tail -20
+
+      - name: Admin content survives container recreation (named volume)
+        run: |
+          set -euo pipefail
+          docker volume create gwdata >/dev/null
+          start_gw() {
+            docker rm -f gw >/dev/null 2>&1 || true
+            docker run -d --name gw \
+              -p 127.0.0.1:8000:8000 \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+              -v gwdata:/var/lib/git-gateway \
+              -e GITHUB_TOKEN=dummy-token-for-smoke-test \
+              -e ADMIN_TOKEN=dummy-admin-token \
+              git-gateway:ci >/dev/null
+            for i in $(seq 1 30); do
+              curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && return 0
+              sleep 1
+            done
+            echo "::error::container did not become healthy"
+            docker logs gw
+            return 1
+          }
+
+          start_gw
+          curl -fsS -X PUT http://127.0.0.1:8000/admin/prompt \
+            -H "Authorization: Bearer dummy-admin-token" \
+            --data-binary "PERSISTENCE-CANARY-must-survive-restart"
+          curl -fsS http://127.0.0.1:8000/Hana-ame/repo | grep -q "PERSISTENCE-CANARY" \
+            || { echo "::error::canary not served before restart"; exit 1; }
+
+          start_gw
+          curl -fsS http://127.0.0.1:8000/Hana-ame/repo | grep -q "PERSISTENCE-CANARY-must-survive-restart" \
+            || { echo "::error::Admin prompt did NOT survive container recreation"; docker logs gw; exit 1; }
+          echo "✓ Admin prompt survived container recreation"
+          docker rm -f gw >/dev/null 2>&1 || true
+          docker volume rm -f gwdata >/dev/null 2>&1 || true
+
+      - name: Unwritable CONTENT_DIR degrades to memory and says so
+        run: |
+          set -euo pipefail
+          docker rm -f gw >/dev/null 2>&1 || true
+          docker run -d --name gw \
+            -p 127.0.0.1:8000:8000 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            -e CONTENT_DIR=/app/ro-content \
+            -e GITHUB_TOKEN=dummy-token-for-smoke-test \
+            -e ADMIN_TOKEN=dummy-admin-token \
+            git-gateway:ci >/dev/null
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && break
+            if [ "$i" -eq 30 ]; then
+              echo "::error::gateway did not start with an unwritable CONTENT_DIR"
+              docker logs gw
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health | node -e "
+          let s=''; process.stdin.on('data', d => s += d).on('end', () => {
+            const h = JSON.parse(s);
+            if (h.ok !== true) throw new Error('ok !== true');
+            if (h.content_store.mode !== 'memory') throw new Error('expected memory mode, got ' + h.content_store.mode);
+            if (!h.content_store.degraded_reason) throw new Error('degraded mode must explain why');
+            console.log('✓ degraded to memory:', h.content_store.degraded_reason.slice(0, 90));
+          });
+          "
+          docker logs gw | grep -qE "content persistence DISABLED|MEMORY ONLY" \
+            || { echo "::error::missing loud warning about disabled persistence"; docker logs gw; exit 1; }
+          echo "✓ startup log warns that Admin content will be lost"
+
+      - name: Container cleanup
+        if: always()
+        run: docker rm -f gw || true
+
+  # ---------------------------------------------------------------- 部署配置
+  deploy-config:
+    name: Deploy assets sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Required deploy files present
+        run: |
+          set -e
+          for f in Dockerfile docker-compose.yml .dockerignore .env.example repos.txt.example \
+                   DEPLOY.md deploy/nginx.conf.example deploy/Caddyfile.example; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+            echo "✓ $f"
+          done
+
+      - name: .env.example covers every referenced variable
+        run: |
+          node -e "
+          const fs = require('fs');
+          const path = require('path');
+          const envExample = fs.readFileSync('.env.example', 'utf8');
+          const declared = new Set([...envExample.matchAll(/^#?\s*([A-Z][A-Z0-9_]+)=/gm)].map(m => m[1]));
+
+          const files = ['index.js', ...fs.readdirSync('src').filter(f => f.endsWith('.js')).map(f => path.join('src', f))];
+          const used = new Set();
+          for (const f of files) {
+            const src = fs.readFileSync(f, 'utf8');
+            for (const m of src.matchAll(/process\.env\.([A-Z][A-Z0-9_]+)/g)) used.add(m[1]);
+            for (const m of src.matchAll(/process\.env\[\s*['\"]([A-Z][A-Z0-9_]+)['\"]\s*\]/g)) used.add(m[1]);
+          }
+
+          const missing = [...used].filter(v => !declared.has(v)).sort();
+          console.log('declared:', [...declared].sort().join(' '));
+          console.log('referenced:', [...used].sort().join(' '));
+          if (missing.length) {
+            console.error('::error::.env.example is missing: ' + missing.join(', '));
+            process.exit(1);
+          }
+          console.log('✓ every code-referenced variable is documented');
+          "
+
+      - name: repos.txt parses and gates by default-deny
+        run: |
+          node -e "
+          const fs = require('fs');
+          const lines = fs.readFileSync('repos.txt', 'utf8')
+            .split('\n').map(l => l.trim())
+            .filter(l => l && !l.startsWith('#'));
+          if (!lines.length) throw new Error('repos.txt produced zero rules');
+          const negations = lines.filter(l => l.startsWith('!'));
+          console.log('rules:', lines.length, '| negations:', negations.length);
+          console.log('✓ repos.txt parsed');
+          "
