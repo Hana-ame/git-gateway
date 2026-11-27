@@ -229,8 +229,14 @@ jobs:
             console.log('✓ degraded to memory:', h.content_store.degraded_reason.slice(0, 90));
           });
           "
-          docker logs gw | grep -qE "content persistence DISABLED|MEMORY ONLY" \
-            || { echo "::error::missing loud warning about disabled persistence"; docker logs gw; exit 1; }
+          # 先落盘再 grep：pipefail 下 `docker logs | grep -q` 会因 grep 提前退出、
+          # docker 收到 SIGPIPE 而让整条管线判失败（日志其实是对的）。
+          docker logs gw > /tmp/gw.log 2>&1 || true
+          if ! grep -qE "content persistence DISABLED|MEMORY ONLY" /tmp/gw.log; then
+            echo "::error::missing loud warning about disabled persistence"
+            cat /tmp/gw.log
+            exit 1
+          fi
           echo "✓ startup log warns that Admin content will be lost"
 
       - name: Container cleanup
