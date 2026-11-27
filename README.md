@@ -101,6 +101,7 @@ python main.py --host 0.0.0.0 --port 8000
 | `GET` | `/<repo_path>/prs/<n>/ci` | 查询 PR 的 CI/CD 汇总状态（`passed`/`failed`/`running`/`none`）与失败 Job 列表 |
 | `GET` | `/<repo_path>/prs/<n>/logs` | 拉取 PR 失败 Job 的真实错误日志（默认纯文本，`?tail=200`、`?all=1`、`?format=json`） |
 | `GET` | `/<repo_path>/actions/jobs/<job_id>/logs` | 拉取指定 Job ID 的错误日志 |
+| `GET` | `/repos` | 只读仓库目录（返回当前生效规则允许的具体仓库列表与别名，供前端看板自动拉取） |
 | `GET` | `/health` | 服务健康检查 |
 
 ### 管理员端点（需 `Authorization: Bearer <ADMIN_TOKEN>`）
