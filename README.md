@@ -50,7 +50,7 @@
 | 部署方式 | 认证做法 |
 |---------|---------|
 | **Docker Compose** | 宿主机先 `gh auth login`；`docker-compose.yml` 默认把 `~/.config/gh` 只读挂载到容器内 `/home/gateway/.config/gh` |
-| **Python 3 / systemd** | 安装脚本创建 `/etc/git-gateway/gh`（700）并写入 `GH_CONFIG_DIR`，执行 `sudo GH_CONFIG_DIR=/etc/git-gateway/gh gh auth login` |
+| **Node.js / systemd** | 安装脚本创建 `/etc/git-gateway/gh`（700）并写入 `GH_CONFIG_DIR`，执行 `sudo GH_CONFIG_DIR=/etc/git-gateway/gh gh auth login` |
 | **显式覆盖** | 在 `.env` 中设置 `GITHUB_TOKEN=ghp_...`，或关闭 `USE_GH_CLI=false` |
 
 `ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。
