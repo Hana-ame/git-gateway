@@ -281,6 +281,16 @@ test('Settings resolves GitHub token from host gh hosts.yml without gh binary, f
     assert.equal(s3.resolveGithubToken(), '');
     assert.equal(s3.tokenSource(), 'none');
     assert.match(s3.tokenHint() || '', /GH_HOST_CONFIG_DIR|GH_TOKEN/);
+
+    // Windows APPDATA\GitHub CLI hosts.yml auto-detection
+    const { defaultGhConfigDir } = require('../src/config');
+    const winDir = defaultGhConfigDir({
+      platform: 'win32',
+      env: { APPDATA: '/win/AppData/Roaming' },
+      homeDir: '/win/Users/alice',
+      existsFn: (p) => p.endsWith(path.join('GitHub CLI', 'hosts.yml')),
+    });
+    assert.equal(winDir, path.join('/win/AppData/Roaming', 'GitHub CLI'));
   } finally {
     if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
     if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;

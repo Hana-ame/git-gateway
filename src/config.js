@@ -206,6 +206,25 @@ function parseGhHostsToken(hostsFile, targetHost = 'github.com') {
   return '';
 }
 
+function defaultGhConfigDir({
+  platform = process.platform,
+  env = process.env,
+  homeDir = os.homedir(),
+  existsFn = fs.existsSync,
+} = {}) {
+  const posixDir = path.join(homeDir, '.config', 'gh');
+  if (platform === 'win32') {
+    const appData = env.APPDATA || (env.USERPROFILE ? path.join(env.USERPROFILE, 'AppData', 'Roaming') : '');
+    if (appData) {
+      const winDir = path.join(appData, 'GitHub CLI');
+      if (existsFn(path.join(winDir, 'hosts.yml'))) return winDir;
+      if (existsFn(path.join(posixDir, 'hosts.yml'))) return posixDir;
+      return winDir;
+    }
+  }
+  return posixDir;
+}
+
 class Settings {
   constructor(overrides = {}) {
     this.host = overrides.host ?? process.env.GATEWAY_HOST ?? '127.0.0.1';
@@ -217,7 +236,7 @@ class Settings {
     this.githubToken = overrides.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? '';
     this.useGhCli = overrides.useGhCli ?? parseBoolEnv('USE_GH_CLI', true);
     this.allowGhCliFallback = overrides.allowGhCliFallback ?? true;
-    this.ghConfigDir = overrides.ghConfigDir ?? process.env.GH_CONFIG_DIR ?? path.join(os.homedir(), '.config', 'gh');
+    this.ghConfigDir = overrides.ghConfigDir ?? process.env.GH_CONFIG_DIR ?? defaultGhConfigDir();
     this.ghCliPath = overrides.ghCliPath ?? process.env.GH_CLI_PATH ?? 'gh';
     this.githubWebBase = (overrides.githubWebBase ?? process.env.GITHUB_WEB_BASE ?? 'https://github.com').replace(/\/+$/, '');
     this.githubApiBase = (overrides.githubApiBase ?? process.env.GITHUB_API_BASE ?? 'https://api.github.com').replace(/\/+$/, '');
@@ -285,10 +304,12 @@ class Settings {
         return yamlToken;
       }
       try {
+        const useShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.ghCliPath);
         const out = execFileSync(this.ghCliPath, ['auth', 'token'], {
           encoding: 'utf-8',
           timeout: 5000,
           stdio: ['ignore', 'pipe', 'ignore'],
+          shell: useShell,
         }).trim();
         if (out) {
           this._cachedToken = out;
@@ -318,7 +339,8 @@ class Settings {
 
   tokenHint() {
     if (this.resolveGithubToken()) return null;
-    return `No GitHub token found. Mount host gh config dir (${this.ghConfigDir}/hosts.yml via GH_CONFIG_DIR / GH_HOST_CONFIG_DIR), set GH_CLI_PATH, or configure GH_TOKEN / GITHUB_TOKEN.`;
+    const hostsPath = path.join(this.ghConfigDir, 'hosts.yml');
+    return `No GitHub token found. Mount host gh config dir (${hostsPath} via GH_CONFIG_DIR / GH_HOST_CONFIG_DIR; on Windows native gh uses %APPDATA%\\GitHub CLI), set GH_CLI_PATH, or configure GH_TOKEN / GITHUB_TOKEN.`;
   }
 
   isPatchPathBlocked(relPath) {
@@ -394,4 +416,5 @@ module.exports = {
   DEFAULT_BLOCKED_PATHS,
   parseBoolEnv,
   parseRepoAliases,
+  defaultGhConfigDir,
 };
