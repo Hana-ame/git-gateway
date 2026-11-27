@@ -39,6 +39,10 @@
 4. **防 CI 投毒与隔离 Worktree**：默认拦截任何修改 `.github/workflows/*` 与 `.github/actions/*` 的 Patch；每次提交在临时 Worktree 中执行，失败不污染本地 Mirror。
 5. **默认用 `gh` CLI 管理认证**：服务启动时调用一次 `gh auth token` 并缓存（不阻塞事件循环），`/health` 会返回 `github_token_source: "gh_cli"`；如需覆盖，显式设置 `GITHUB_TOKEN` 即可（优先级更高）。无需 SSH 密钥，纯 HTTPS + GitHub REST API v3。
 
+### 安全边界与纵深防御建议
+
+`git-gateway` 在网关层阻断 `.github/workflows/*`、`.github/actions/*` 篡改与 `mode 120000` 符号链接逃逸，并将写入锁定在 `<nickname>/<base_branch>`；生产仓库建议同时在上游 GitHub 设置中开启默认只读 `GITHUB_TOKEN`、不在 `pull_request` 工作流注入生产部署 Secret，以构成完整的纵深防御。
+
 ## 认证方式
 
 三种部署方式都默认复用**已登录的 `gh` CLI**，无需在配置里保存 Token：
