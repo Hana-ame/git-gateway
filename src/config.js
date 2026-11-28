@@ -225,10 +225,30 @@ function defaultGhConfigDir({
   return posixDir;
 }
 
+function parseBindAddr(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (s.startsWith('[')) {
+    const m = s.match(/^\[([^\]]+)\]:(\d+)$/);
+    if (m) return { host: m[1], port: Number(m[2]) };
+    return null;
+  }
+  const idx = s.lastIndexOf(':');
+  if (idx > 0 && idx < s.length - 1) {
+    const host = s.slice(0, idx).trim();
+    const port = Number(s.slice(idx + 1).trim());
+    if (host && Number.isFinite(port) && port >= 1 && port <= 65535) {
+      return { host, port: Math.floor(port) };
+    }
+  }
+  return null;
+}
+
 class Settings {
   constructor(overrides = {}) {
-    this.host = overrides.host ?? process.env.GATEWAY_HOST ?? '127.0.0.1';
-    this.port = overrides.port ?? parseIntEnv('GATEWAY_PORT', 8000);
+    const _parsedAddr = parseBindAddr(overrides.addr ?? process.env.GATEWAY_ADDR ?? process.env.GIT_GATEWAY_ADDR ?? process.env.BIND_ADDR);
+    this.host = overrides.host ?? _parsedAddr?.host ?? process.env.GATEWAY_HOST ?? process.env.HOST ?? '127.0.0.1';
+    this.port = overrides.port ?? _parsedAddr?.port ?? parseIntEnv('GATEWAY_PORT', parseIntEnv('PORT', 8000));
     this.publicBaseUrl = (overrides.publicBaseUrl ?? process.env.PUBLIC_BASE_URL ?? '').replace(/\/+$/, '');
     this.trustProxyHeaders = overrides.trustProxyHeaders ?? parseBoolEnv('TRUST_PROXY_HEADERS', true);
 

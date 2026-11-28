@@ -16,7 +16,7 @@ services:
       CONTENT_DIR: "/var/lib/git-gateway/content"
       GH_CONFIG_DIR: "/home/gateway/.config/gh"
     ports:
-      - "${BIND_HOST:-0.0.0.0}:${GATEWAY_PORT:-8000}:8000"
+      - "${GATEWAY_BIND_ADDR:-${GATEWAY_ADDR:-${BIND_HOST:-0.0.0.0}:${GATEWAY_PORT:-8000}}}:8000"
     volumes:
       # 1. 只读挂载 gitignore 风格白名单/黑名单规则文件（支持热重载）
       - ./repos.txt:/app/repos.txt:ro
